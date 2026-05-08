@@ -4309,7 +4309,10 @@
           }
 
           const showWindowM = 50;
-          const hideAfterM = 40;
+          // Nachlauf nach dem Abbiegepunkt: Overlay bleibt noch ca. 20 m sichtbar, damit
+          // der User die Bestätigung sieht ("ich bin korrekt abgebogen") und es kurz danach
+          // wieder verschwindet, bevor es im Weg ist.
+          const hideAfterM = 20;
           const distToManeuverM = maneuverPosAlongM - along;
 
           if (distToManeuverM <= showWindowM && distToManeuverM >= 0) {
