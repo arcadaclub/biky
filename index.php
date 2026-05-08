@@ -465,6 +465,7 @@ if (is_file($appJsPath)) {
                     <div class="nav-stat-tiles" aria-label="Navigationsstatistik">
                         <span class="nav-stat-tile"><span class="nav-stat-label">Gefahren</span><strong id="nav-stat-distance">0,0 km</strong></span>
                         <span class="nav-stat-tile"><span class="nav-stat-label">Zeit</span><strong id="nav-stat-time">00:00</strong></span>
+                        <span class="nav-stat-tile" title="Geschätzte Ankunft am Ziel"><span class="nav-stat-label">Ankunft</span><strong id="nav-stat-eta">—</strong></span>
                     </div>
                 </div>
             </div>
@@ -748,6 +749,7 @@ if (is_file($appJsPath)) {
                     <div class="changelog-day">
                         <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.5</div>
                         <ul class="changelog-list">
+                            <li><strong>Ankunftszeit im Navigationspanel:</strong> Eine neue Kachel zeigt die geschätzte Ankunftszeit als Uhrzeit an. Die Schätzung kombiniert die ursprüngliche Routen-Schätzung mit deinem tatsächlich gefahrenen Schnitt – Pausen und Tempowechsel werden berücksichtigt.</li>
                             <li><strong>Rückführung zur Route ist deutlich klüger:</strong> Die App reagiert jetzt schneller, wenn du klar von der Strecke abgekommen bist, und wartet entspannter, wenn du nur knapp neben der Linie fährst. Schwellenwerte passen sich automatisch an deine Geschwindigkeit an – Rennradfahrer bekommen mehr Toleranz, langsame Fahrer engere.</li>
                             <li>Wenn du in die <strong>Gegenrichtung</strong> fährst, schiebt Biky den Wiedereinstieg auf der geplanten Strecke nach vorne. So wird kein unnötiger U-Turn auf den letzten Metern erzwungen.</li>
                             <li>Bei großem Abstand zur Strecke wird das <strong>Wiedereinstiegs-Fenster</strong> automatisch weiter gesetzt, damit das Ziel sinnvoll vor dir liegt und nicht direkt am aktuellen Standort klebt.</li>

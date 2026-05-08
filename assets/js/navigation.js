@@ -707,6 +707,28 @@
     return h > 0 ? h + ':' + pad(min) + ':' + pad(s) : pad(min) + ':' + pad(s);
   }
 
+  /**
+   * Geschätzte Ankunftszeit als HH:MM. Für Tagesübergänge (>12h Restzeit) wird "—" geliefert,
+   * weil ein konkreter Zeitpunkt dann kein nützliches Display ist (Pause/Rast/Tour-Ende).
+   */
+  function fmtEtaClock(remainingM, vEffMs) {
+    if (!Number.isFinite(remainingM) || remainingM <= 5) {
+      return '—';
+    }
+    if (!Number.isFinite(vEffMs) || vEffMs < 0.4) {
+      return '—';
+    }
+    const remainingSec = remainingM / vEffMs;
+    if (remainingSec > 12 * 3600) {
+      return '—';
+    }
+    const eta = new Date(Date.now() + remainingSec * 1000);
+    const pad = function (n) {
+      return String(n).padStart(2, '0');
+    };
+    return pad(eta.getHours()) + ':' + pad(eta.getMinutes());
+  }
+
   function isEditableElement(el) {
     if (!el || el === document.body || el === document.documentElement) {
       return false;
@@ -3574,6 +3596,16 @@
       }
       this.geometry = data.geometry;
       this.cumDist = buildCumulativeDistances(data.geometry, this.Lref);
+      // ORS-Schätzung als ETA-Basis: distance ist in km, duration in Sekunden. Wenn vorhanden,
+      // ergibt sich daraus eine plausible Durchschnittsgeschwindigkeit (cycling-typisch
+      // 12-22 km/h) — dient als Fallback, wenn live noch keine Bewegung vorliegt.
+      const distanceKm = Number(data && data.distance);
+      const durationSec = Number(data && data.duration);
+      if (Number.isFinite(distanceKm) && distanceKm > 0.05 && Number.isFinite(durationSec) && durationSec > 30) {
+        this._routeAvgSpeedMs = (distanceKm * 1000) / durationSec;
+      } else {
+        this._routeAvgSpeedMs = null;
+      }
       if (this.isNavActive()) {
         // Bei Umleitungen/Route-Restore springt die Along-Meter-Skala. Teilkilometer bleiben, nur Referenz neu setzen.
         this._fitnessLastAlongM = null;
@@ -4277,6 +4309,7 @@
 
       const statDistance = document.getElementById('nav-stat-distance');
       const statTime = document.getElementById('nav-stat-time');
+      const statEta = document.getElementById('nav-stat-eta');
       const nextDist = document.getElementById('nav-next-dist');
       const arrow = document.getElementById('nav-arrow');
       const text = document.getElementById('nav-text');
@@ -4287,6 +4320,35 @@
       }
       if (statTime) {
         statTime.textContent = fmtElapsedTime(Date.now() - (this._navStartedAtMs || Date.now()));
+      }
+      if (statEta) {
+        if (state.arrived) {
+          statEta.textContent = '—';
+        } else {
+          const totalRouteM = this.cumDist[this.cumDist.length - 1] || 0;
+          const remainingM = Math.max(0, totalRouteM - (along || 0));
+          const elapsedMs = Date.now() - (this._navStartedAtMs || Date.now());
+          // Mischung aus ORS-Routenschnitt und live gefahrenem Schnitt:
+          //  - vor 30 s und unter 100 m: ORS-Schätzung (Live noch zu rauschig).
+          //  - danach: 60 % live + 40 % ORS, damit Unterschiede zur ORS-Schätzung
+          //    (Pause, Steigung, Gegenwind) realistisch ins ETA durchschlagen.
+          let vEff = this._routeAvgSpeedMs || null;
+          if (
+            (this._distanceTraveledM || 0) > 100 &&
+            elapsedMs > 30000
+          ) {
+            const vTraveled = (this._distanceTraveledM || 0) / (elapsedMs / 1000);
+            if (vTraveled > 0.4) {
+              vEff = this._routeAvgSpeedMs ? 0.6 * vTraveled + 0.4 * this._routeAvgSpeedMs : vTraveled;
+            }
+          }
+          // Untergrenze 1,5 m/s (5,4 km/h, langsame Fahrradtour). Verhindert ETA = absurd weit
+          // in der Zukunft, wenn der User gerade Pause macht und vTraveled gegen 0 fällt.
+          if (Number.isFinite(vEff) && vEff > 0) {
+            vEff = Math.max(1.5, vEff);
+          }
+          statEta.textContent = fmtEtaClock(remainingM, vEff);
+        }
       }
       if (nextDist) {
         nextDist.textContent = state.arrived ? '—' : fmtDistM(state.distToManeuver);
