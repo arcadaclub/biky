@@ -3618,11 +3618,15 @@
         const start = g[0];
         const end = g[g.length - 1];
         if (Array.isArray(start) && Array.isArray(end)) {
-          const dStartEnd = this.Lref.distance(
-            { lat: Number(start[0]), lng: Number(start[1]) },
-            { lat: Number(end[0]), lng: Number(end[1]) }
-          );
-          geometricallyClosed = Number.isFinite(dStartEnd) && dStartEnd < 30;
+          try {
+            // Leaflet: L.latLng(a).distanceTo(b) — kein L.distance(a, b).
+            const dStartEnd = this.Lref.latLng(Number(start[0]), Number(start[1])).distanceTo(
+              this.Lref.latLng(Number(end[0]), Number(end[1]))
+            );
+            geometricallyClosed = Number.isFinite(dStartEnd) && dStartEnd < 30;
+          } catch (eD) {
+            geometricallyClosed = false;
+          }
         }
       }
       const tempRejoin = !!(data && (data._nrTemporaryRejoin || data._nrReturnToStart));
