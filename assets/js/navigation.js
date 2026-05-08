@@ -10,12 +10,21 @@
    * zwischen Vor- und Rückschwelle verhindert L/R-Flattern bei GPS-Rauschen).
    */
   const NAV_STEP_RETREAT_EPS_M = 28;
-  /** Querabstand zur geplanten Linie größer → Neu-Routing prüfen (GPS, nicht Simulation). */
-  const NAV_OFF_ROUTE_THRESH_M = 100;
-  /** So viele aufeinanderfolgende Messungen über Schwellwert, bevor neu geroutet wird. */
-  const NAV_OFF_ROUTE_STREAK = 2;
-  /** Mindestabstand zwischen Neu-Routing-Anfragen (ms). */
-  const NAV_REROUTE_COOLDOWN_MS = 14000;
+  /**
+   * Querabstand zur geplanten Linie größer → Neu-Routing prüfen (GPS, nicht Simulation).
+   * Wird in `maybeEvaluateOffRouteReroute` adaptiv mit der Geschwindigkeit skaliert
+   * (langsame Fahrer brauchen engere Toleranzen, schnelle weitere).
+   */
+  const NAV_OFF_ROUTE_THRESH_BASE_M = 60;
+  const NAV_OFF_ROUTE_THRESH_MIN_M = 60;
+  const NAV_OFF_ROUTE_THRESH_MAX_M = 180;
+  /** Geschwindigkeitsfaktor (m je km/h, der zur Basis-Schwelle hinzukommt). */
+  const NAV_OFF_ROUTE_THRESH_PER_KMH = 2.5;
+  /** Maximale aufeinanderfolgende Messungen über Schwellwert, bevor neu geroutet wird. */
+  const NAV_OFF_ROUTE_STREAK_MAX = 3;
+  /** Cooldown zwischen Reroute-Anfragen — adaptiv (kürzer bei klar großem Off-Track). */
+  const NAV_REROUTE_COOLDOWN_BASE_MS = 14000;
+  const NAV_REROUTE_COOLDOWN_MIN_MS = 8000;
   /** Am Streifenende kein Umrouten mehr (letzte Meter). */
   const NAV_REROUTE_NEAR_END_M = 40;
   /** Zusätzlicher Zoom in „Karte Fahrtrichtung“ nach der Cover-Berechnung (Ränder, Kacheln, UI). */
@@ -1596,7 +1605,16 @@
     },
 
     /**
-     * GPS weicht von der Linie ab → Event an die App, die neu routet (Cooldown + Serienstabilität).
+     * GPS weicht von der Linie ab → Event an die App, die neu routet (adaptiver Cooldown +
+     * geschwindigkeitsabhängige Schwellwerte + Serien-Stabilität).
+     *
+     * Adaptive Logik:
+     * - Cross-Track-Schwelle wächst mit Geschwindigkeit: ein Rennradfahrer hat mehr seitlichen
+     *   Versatz auf der Linie als ein Wanderer; gemessenes Off-Route ist erst dann ein echtes Off.
+     * - Streak: bei sehr klarem Off-Track (>2× Schwelle) wird sofort getriggert; bei knapp drüber
+     *   warten wir noch auf Bestätigung — verhindert false-positives bei GPS-Jitter.
+     * - Cooldown: bei großem Off-Track früher wieder triggerbar (User soll nicht 14 s lang in
+     *   die falsche Richtung fahren), bei kleinem Off-Track normal.
      */
     maybeEvaluateOffRouteReroute: function (latlng, along, isSim) {
       if (isSim || !this.geometry || !this.cumDist || !this.Lref || !latlng) {
@@ -1606,9 +1624,6 @@
         return;
       }
       const total = this.cumDist[this.cumDist.length - 1] || 0;
-      // Untere Vorwärts-Schranke: maximale bisher gefahrene Position UND letzte passierte Abbiegung —
-      // verhindert auf Rundkursen, dass der Snap- oder Reroute-Algorithmus uns zurück zu einem
-      // bereits absolvierten Streckenabschnitt schickt.
       const forwardAlong = Math.max(
         0,
         Math.min(
@@ -1620,18 +1635,43 @@
         this._offRouteStreak = 0;
         return;
       }
+
       const x = crossTrackDistanceM(latlng, this.geometry, this.cumDist, this.Lref, this._lastSnapSegIndex);
-      if (x > NAV_OFF_ROUTE_THRESH_M) {
-        this._offRouteStreak = Math.min(NAV_OFF_ROUTE_STREAK, this._offRouteStreak + 1);
-      } else {
+      const speedKmh = Math.max(0, (Number(this._lastSpeedMs) || 0) * 3.6);
+      const threshM = clampNumber(
+        NAV_OFF_ROUTE_THRESH_BASE_M + speedKmh * NAV_OFF_ROUTE_THRESH_PER_KMH,
+        NAV_OFF_ROUTE_THRESH_MIN_M,
+        NAV_OFF_ROUTE_THRESH_MAX_M
+      );
+
+      if (x <= threshM) {
         this._offRouteStreak = 0;
-      }
-      if (this._offRouteStreak < NAV_OFF_ROUTE_STREAK) {
         return;
       }
-      if (Date.now() - this._lastRerouteMs < NAV_REROUTE_COOLDOWN_MS) {
+
+      this._offRouteStreak = Math.min(NAV_OFF_ROUTE_STREAK_MAX, (this._offRouteStreak || 0) + 1);
+
+      // Streak-Anforderung adaptiv: x ≥ 2,2× threshM → 1 Messung reicht (klares Off);
+      // x ≥ 1,5× threshM → 2 Messungen; sonst 3 Messungen warten.
+      let requiredStreak;
+      if (x >= threshM * 2.2) {
+        requiredStreak = 1;
+      } else if (x >= threshM * 1.5) {
+        requiredStreak = 2;
+      } else {
+        requiredStreak = 3;
+      }
+      if (this._offRouteStreak < requiredStreak) {
         return;
       }
+
+      // Cooldown adaptiv: bei klar großem Off (>2× Schwelle) auf Minimum reduzieren.
+      const cooldownMs =
+        x >= threshM * 2.0 ? NAV_REROUTE_COOLDOWN_MIN_MS : NAV_REROUTE_COOLDOWN_BASE_MS;
+      if (Date.now() - this._lastRerouteMs < cooldownMs) {
+        return;
+      }
+
       this._rerouteInFlight = true;
       this._offRouteStreak = 0;
       const lastManeuverAlongM = Number.isFinite(this._lastPassedManeuverAlongM)
@@ -1643,6 +1683,10 @@
         {
           along_m: Math.round(forwardAlong),
           cross_track_m: Math.round(x),
+          thresh_m: Math.round(threshM),
+          speed_kmh: Math.round(speedKmh),
+          required_streak: requiredStreak,
+          cooldown_ms: cooldownMs,
           last_maneuver_along_m: Math.round(lastManeuverAlongM),
           last_maneuver_index: lastManeuverIndex,
           lat: Math.round(latlng.lat * 100000) / 100000,
@@ -1657,6 +1701,7 @@
             lng: latlng.lng,
             crossTrackM: Math.round(x),
             alongM: Math.round(forwardAlong),
+            speedKmh: Math.round(speedKmh),
             lastManeuverAlongM: Math.round(lastManeuverAlongM),
             lastManeuverIndex: lastManeuverIndex,
           },

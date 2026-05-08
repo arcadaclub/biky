@@ -1439,7 +1439,96 @@
     });
   }
 
-  async function rerouteCleanedLoopCandidate(candidate, sourceData) {
+  /**
+   * Fingerprint einer Spike-Liste: identische Sackgassen → identischer String. Wird zwischen
+   * den Pässen verglichen, um Endlos-Durchläufe zu erkennen, wenn Reroute den exakt gleichen
+   * Stich erneut produziert.
+   */
+  function spikeFingerprint(segments) {
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return '';
+    }
+    return segments
+      .map(function (s) {
+        const start = Math.round((s.start_path_m || 0) / 25);
+        const end = Math.round((s.end_path_m || 0) / 25);
+        const away = Math.round((s.max_away_m || 0) / 25);
+        return start + '|' + end + '|' + away;
+      })
+      .sort()
+      .join(',');
+  }
+
+  /**
+   * Geometrische Sperrzonen aus den Schnitt-Spitzen ableiten: jeweils der Mittelpunkt eines
+   * geschnittenen Stichs (worst-case Spike-Maximum) plus 1,2× max_away als Radius. Das
+   * Wegpunkt-Sampling meidet diese Zonen, damit der Reroute nicht direkt wieder dort entlang läuft.
+   */
+  function buildSpikeAvoidZones(originalGeometry, segments) {
+    if (!Array.isArray(originalGeometry) || originalGeometry.length < 2 || !Array.isArray(segments)) {
+      return [];
+    }
+    const cum = cumulativeDistances(originalGeometry);
+    const total = cum[cum.length - 1] || 0;
+    const zones = [];
+    segments.forEach(function (segment) {
+      const mid = ((segment.start_path_m || 0) + (segment.end_path_m || 0)) / 2;
+      if (mid <= 0 || mid >= total) {
+        return;
+      }
+      let bestIdx = -1;
+      let bestDelta = Infinity;
+      for (let i = 0; i < cum.length; i++) {
+        const delta = Math.abs(cum[i] - mid);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx < 0) {
+        return;
+      }
+      const radius = Math.max(60, 1.2 * (segment.max_away_m || 80));
+      zones.push({
+        lat: Number(originalGeometry[bestIdx][0]),
+        lng: Number(originalGeometry[bestIdx][1]),
+        radiusM: radius,
+      });
+    });
+    return zones;
+  }
+
+  function pointInsideAnyAvoidZone(latLng, zones) {
+    if (!zones || zones.length === 0) {
+      return false;
+    }
+    const ll = L.latLng(latLng[0], latLng[1]);
+    for (let i = 0; i < zones.length; i++) {
+      if (map.distance(ll, L.latLng(zones[i].lat, zones[i].lng)) <= zones[i].radiusM) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function filterWaypointsAvoidingZones(waypoints, zones) {
+    if (!Array.isArray(waypoints) || waypoints.length < 3) {
+      return waypoints;
+    }
+    if (!zones || zones.length === 0) {
+      return waypoints;
+    }
+    const kept = waypoints.filter(function (w, idx) {
+      // Start (idx 0) immer behalten, sonst keine geschlossene Schleife mehr.
+      if (idx === 0) {
+        return true;
+      }
+      return !pointInsideAnyAvoidZone(w, zones);
+    });
+    return kept.length >= 3 ? kept : waypoints;
+  }
+
+  async function rerouteCleanedLoopCandidate(candidate, sourceData, avoidZones) {
     if (!candidate || !Array.isArray(candidate.geometry) || candidate.geometry.length < 3) {
       return null;
     }
@@ -1451,15 +1540,19 @@
       rerouteMeta.waypoints.length >= 3
         ? rerouteMeta.waypoints
         : null;
-    const body = {
-      loop_from_waypoints: true,
-      // Wegpunkte-Rundkurs: Original-Wegpunkte immer beibehalten, damit alle Punkte angefahren werden.
-      waypoints: originalWaypoints || sampleLoopWaypointsFromGeometry(candidate.geometry, 8),
-      profil: (rerouteMeta && rerouteMeta.profil) || currentProfile(),
-    };
-    if (!Array.isArray(body.waypoints) || body.waypoints.length < 3) {
+    let waypoints = originalWaypoints || sampleLoopWaypointsFromGeometry(candidate.geometry, 8);
+    // Original-Wegpunkte (User-Input) sind sakrosankt — nur generische Samples werden gefiltert.
+    if (!originalWaypoints) {
+      waypoints = filterWaypointsAvoidingZones(waypoints, avoidZones);
+    }
+    if (!Array.isArray(waypoints) || waypoints.length < 3) {
       return null;
     }
+    const body = {
+      loop_from_waypoints: true,
+      waypoints: waypoints,
+      profil: (rerouteMeta && rerouteMeta.profil) || currentProfile(),
+    };
     const rerouted = await fetchJsonWithTimeout(
       apiUrl('api/route.php'),
       {
@@ -1480,6 +1573,13 @@
   /**
    * Nach jedem Schnitt können weitere Hin-und-zurück-Äste sichtbar werden, weil sich die
    * Geometrie ändert. Mehrere Durchläufe ersetzen das bisher nötige manuelle Nachklicken.
+   *
+   * Schutzmechanismen gegen Endlos-Pingpong:
+   * 1. Spike-Fingerprint: identische Sackgassen zweimal hintereinander → abbrechen.
+   * 2. Qualitäts-Check: wenn Reroute mehr Spikes erzeugt als die geschnittene Geometrie hatte,
+   *    wird das Reroute verworfen und die geschnittene Variante (ohne Reroute) zurückgegeben.
+   * 3. Distanz-Sanity: wenn Reroute die Strecke um >40 % gegen die geschnittene Geometrie
+   *    aufbläht, wird die geschnittene Variante bevorzugt.
    */
   const ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT = 5;
 
@@ -1493,25 +1593,64 @@
         : ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT;
     let current = Object.assign({}, data);
     let totalRemovedRanges = 0;
+    let lastFingerprint = '';
     for (let pass = 0; pass < passes; pass++) {
       const segments = nrFindReliableNoExitSegments(current.geometry);
       if (!segments.length) {
-        return Object.assign({}, current, {
-          dead_end_segments_removed: totalRemovedRanges,
-        });
+        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
       }
+      const fingerprint = spikeFingerprint(segments);
+      if (fingerprint && fingerprint === lastFingerprint) {
+        // Identische Sackgassen wie im vorigen Pass → Reroute hat sie nicht beseitigt, weitere
+        // Iterationen sparen wir uns. Geschnittene Geometrie ist immer noch besser als das Original.
+        const cleanedFinal = removeDeadEndSegmentsFromGeometry(current, segments);
+        if (cleanedFinal) {
+          return Object.assign({}, cleanedFinal, {
+            dead_end_segments_removed: totalRemovedRanges + (cleanedFinal.dead_end_segments_removed || 0),
+            reroute_skipped_reason: 'spike_fingerprint_repeat',
+          });
+        }
+        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
+      }
+      lastFingerprint = fingerprint;
+
       const cleaned = removeDeadEndSegmentsFromGeometry(current, segments);
       if (!cleaned) {
-        return Object.assign({}, current, {
-          dead_end_segments_removed: totalRemovedRanges,
+        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
+      }
+
+      const avoidZones = buildSpikeAvoidZones(current.geometry, segments);
+      let rerouted;
+      try {
+        rerouted = await rerouteCleanedLoopCandidate(cleaned, current, avoidZones);
+      } catch (err) {
+        // Reroute fehlgeschlagen — geschnittene Variante (ohne ORS-Roundtrip) ist immer noch besser.
+        return Object.assign({}, cleaned, {
+          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
+          reroute_failed: true,
         });
       }
-      const rerouted = await rerouteCleanedLoopCandidate(cleaned, current);
       if (!rerouted) {
-        return Object.assign({}, current, {
-          dead_end_segments_removed: totalRemovedRanges,
+        return Object.assign({}, cleaned, {
+          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
         });
       }
+
+      // Qualitäts-Vergleich: Reroute darf nicht mehr Spikes haben als die geschnittene Variante,
+      // sonst war der ORS-Call kontraproduktiv (typisch bei Sackgassen-Cluster, das ORS umfährt
+      // und dabei eine andere Sackgasse anschneidet).
+      const reroutedSpikes = nrFindReliableNoExitSegments(rerouted.geometry);
+      const cleanedSpikes = nrFindReliableNoExitSegments(cleaned.geometry);
+      const cleanedDistKm = Number(cleaned.distance) || 0;
+      const reroutedDistKm = Number(rerouted.distance) || 0;
+      const distInflated = cleanedDistKm > 0.5 && reroutedDistKm > cleanedDistKm * 1.4;
+      if (reroutedSpikes.length > cleanedSpikes.length || distInflated) {
+        return Object.assign({}, cleaned, {
+          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
+          reroute_rejected_reason: distInflated ? 'distance_inflated' : 'more_spikes_after_reroute',
+        });
+      }
+
       totalRemovedRanges += cleaned.dead_end_segments_removed || 0;
       current = Object.assign({}, rerouted, {
         dead_end_segments_removed: totalRemovedRanges,
@@ -1735,19 +1874,70 @@
     let current = data;
     let totalRemovedRanges = 0;
     let lastPatched = null;
+    let lastFingerprint = '';
     for (let pass = 0; pass < ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT; pass++) {
       const segments = nrFindReliableNoExitSegments(current.geometry);
       if (!segments.length) {
         break;
       }
+      const fingerprint = spikeFingerprint(segments);
+      if (fingerprint && fingerprint === lastFingerprint) {
+        // Reroute hat dieselbe Sackgasse erneut produziert — die geschnittene Variante (ohne Reroute)
+        // ist immer noch besser als das Original und wird hier finalisiert.
+        const cleanedFinal = removeDeadEndSegmentsFromGeometry(current, segments);
+        if (cleanedFinal) {
+          totalRemovedRanges += cleanedFinal.dead_end_segments_removed || 0;
+          lastPatched = Object.assign({}, cleanedFinal, {
+            dead_end_segments_removed: totalRemovedRanges,
+            reroute_skipped_reason: 'spike_fingerprint_repeat',
+          });
+        }
+        break;
+      }
+      lastFingerprint = fingerprint;
+
       const next = removeDeadEndSegmentsFromGeometry(current, segments);
       if (!next) {
         break;
       }
-      const rerouted = await rerouteCleanedLoopCandidate(next, current);
-      if (!rerouted) {
+      const avoidZones = buildSpikeAvoidZones(current.geometry, segments);
+      let rerouted;
+      try {
+        rerouted = await rerouteCleanedLoopCandidate(next, current, avoidZones);
+      } catch (err) {
+        // ORS-Reroute fehlgeschlagen — geschnittene Variante als Endergebnis akzeptieren.
+        totalRemovedRanges += next.dead_end_segments_removed || 0;
+        lastPatched = Object.assign({}, next, {
+          dead_end_segments_removed: totalRemovedRanges,
+          reroute_failed: true,
+        });
         break;
       }
+      if (!rerouted) {
+        totalRemovedRanges += next.dead_end_segments_removed || 0;
+        lastPatched = Object.assign({}, next, {
+          dead_end_segments_removed: totalRemovedRanges,
+        });
+        break;
+      }
+
+      // Reroute-Qualitätsvergleich: weniger oder gleich viele Spikes erforderlich, sonst ist
+      // der ORS-Reroute kontraproduktiv (kann passieren, wenn ORS einen Cluster umfährt und
+      // dabei eine andere Sackgasse trifft). Distanz-Sanity verhindert maßlose Aufblähung.
+      const reroutedSpikes = nrFindReliableNoExitSegments(rerouted.geometry);
+      const cleanedSpikes = nrFindReliableNoExitSegments(next.geometry);
+      const cleanedDistKm = Number(next.distance) || 0;
+      const reroutedDistKm = Number(rerouted.distance) || 0;
+      const distInflated = cleanedDistKm > 0.5 && reroutedDistKm > cleanedDistKm * 1.4;
+      if (reroutedSpikes.length > cleanedSpikes.length || distInflated) {
+        totalRemovedRanges += next.dead_end_segments_removed || 0;
+        lastPatched = Object.assign({}, next, {
+          dead_end_segments_removed: totalRemovedRanges,
+          reroute_rejected_reason: distInflated ? 'distance_inflated' : 'more_spikes_after_reroute',
+        });
+        break;
+      }
+
       totalRemovedRanges += next.dead_end_segments_removed || 0;
       current = Object.assign({}, rerouted, {
         dead_end_segments_removed: totalRemovedRanges,
@@ -5493,9 +5683,23 @@
   const NAV_REROUTE_MAX_AHEAD_M = 5000;
   /** Anker-Distanz vor dem Ziel, um ORS in Streckenrichtung zu führen. */
   const NAV_REROUTE_ANCHOR_BACK_M = 60;
-  /** Fallback-Heuristik (geometrischer Punkt), wenn keine passenden Manöver-Steps existieren. */
+  /**
+   * Fallback-Heuristik (geometrischer Punkt), wenn keine passenden Manöver-Steps existieren.
+   * Mindest-/Maximal-Vorwärts skalieren mit Cross-Track-Abstand: bei großem Off-Track muss der
+   * Rejoin-Punkt weiter vorne liegen, sonst routet ORS einen unnötigen Rückwärts-Bogen.
+   */
   const NAV_REROUTE_FALLBACK_MIN_AHEAD_M = 180;
   const NAV_REROUTE_FALLBACK_MAX_AHEAD_M = 650;
+  const NAV_REROUTE_FALLBACK_MIN_FACTOR = 0.6;
+  const NAV_REROUTE_FALLBACK_MAX_FACTOR = 2.4;
+  /**
+   * Bearing-Plausibilität: wenn die User-Bewegung mehr als diesen Winkel von der Original-Strecke
+   * am Rejoin-Anker abweicht, wird ein deutlich weiter entferntes Ziel gewählt — sonst verlangt
+   * der Reroute einen physisch unmöglichen U-Turn.
+   */
+  const NAV_REROUTE_BEARING_DEVIATION_DEG = 110;
+  /** Bei großer Bearing-Abweichung: zusätzliche Vorwärts-Distanz, um sinnvoll wieder einzufädeln. */
+  const NAV_REROUTE_BEARING_PUSH_M = 350;
 
   /**
    * Liefert die Position (Streckenmeter, Geometrie-Index) des nächsten echten Abbiege-Wegpunkts,
@@ -5543,6 +5747,27 @@
     return null;
   }
 
+  function navRerouteBearingDeg(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) {
+      return null;
+    }
+    const lat1 = (Number(a[0]) * Math.PI) / 180;
+    const lat2 = (Number(b[0]) * Math.PI) / 180;
+    const dLng = ((Number(b[1]) - Number(a[1])) * Math.PI) / 180;
+    const y = Math.sin(dLng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+    const deg = (Math.atan2(y, x) * 180) / Math.PI;
+    return ((deg % 360) + 360) % 360;
+  }
+
+  function navRerouteAngleDelta(a, b) {
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      return 0;
+    }
+    let d = ((b - a) % 360 + 540) % 360 - 180;
+    return Math.abs(d);
+  }
+
   /**
    * Wählt das Reroute-Ziel auf der Originalroute. Strategie (in dieser Reihenfolge):
    *
@@ -5551,15 +5776,21 @@
    *    Streckenrichtung. Bei Rundkursen verhindert das, dass eine Stelle gewählt wird,
    *    die geometrisch nahe, aber auf der Strecke bereits passiert wurde.
    * 2. Fallback (keine Manöver mehr in Reichweite oder fehlende Steps): geometrisch nächster
-   *    Polylinien-Punkt im Vorwärts-Fenster `[safeAlong + 180, safeAlong + 650]`.
+   *    Polylinien-Punkt im Vorwärts-Fenster, das mit Cross-Track skaliert
+   *    (`[forwardBase + max(180, 0.6×x), forwardBase + max(650, 2.4×x)]`).
+   *
+   * Bearing-Plausibilität: wenn der User effektiv in Gegenrichtung der Originalstrecke fährt,
+   * wird der Anker auf der Strecke nach vorne geschoben (`bearingPush`), damit ORS keinen
+   * unnötigen U-Turn auf den letzten 50 m zurücklegt.
    *
    * @param {{ geometry: number[][], navigation?: { steps?: Array } }} routeData
    * @param {number} alongM Aktuelle Vorwärts-Position (Snap, monoton steigend)
    * @param {number} currentLat
    * @param {number} currentLng
    * @param {number} [lastManeuverAlongM] Position der zuletzt passierten Abbiegung (Vorwärts-Anker)
+   * @param {{ crossTrackM?: number }} [opts]
    */
-  function pickOriginalRouteRejoinTarget(routeData, alongM, currentLat, currentLng, lastManeuverAlongM) {
+  function pickOriginalRouteRejoinTarget(routeData, alongM, currentLat, currentLng, lastManeuverAlongM, opts) {
     if (!routeData || !Array.isArray(routeData.geometry) || routeData.geometry.length < 2) {
       return null;
     }
@@ -5568,8 +5799,35 @@
     const total = cum[cum.length - 1] || 0;
     const safeAlong = Math.max(0, Math.min(total, Number.isFinite(alongM) ? alongM : 0));
     const lastTurn = Number.isFinite(lastManeuverAlongM) ? Math.max(0, Math.min(total, lastManeuverAlongM)) : 0;
-    // Vorwärts-Anker: niemals hinter dem Snap-Punkt UND niemals hinter der zuletzt passierten Abbiegung.
-    const forwardBaseM = Math.max(safeAlong, lastTurn);
+    const crossTrackM = Math.max(0, Number.isFinite(opts && opts.crossTrackM) ? opts.crossTrackM : 0);
+
+    // Bearing-Plausibilität: User-Bewegungsrichtung (Snap-Punkt → aktuelle Position) gegen
+    // die Streckenrichtung am Snap-Punkt. Große Abweichung ⇒ Reroute-Anker später setzen,
+    // damit ORS nicht in einen U-Turn an der falschen Seite gezwungen wird.
+    let bearingPushM = 0;
+    if (geometry.length >= 2 && Number.isFinite(currentLat) && Number.isFinite(currentLng)) {
+      let snapIdx = 0;
+      for (let i = 0; i < cum.length; i++) {
+        if (cum[i] >= safeAlong) {
+          snapIdx = i;
+          break;
+        }
+      }
+      const snapPrev = geometry[Math.max(0, snapIdx - 1)];
+      const snapHere = geometry[Math.min(geometry.length - 1, snapIdx)];
+      if (Array.isArray(snapPrev) && Array.isArray(snapHere)) {
+        const routeBearing = navRerouteBearingDeg(snapPrev, snapHere);
+        const userBearing = navRerouteBearingDeg(snapHere, [currentLat, currentLng]);
+        if (routeBearing !== null && userBearing !== null) {
+          const deviation = navRerouteAngleDelta(routeBearing, userBearing);
+          if (deviation > NAV_REROUTE_BEARING_DEVIATION_DEG) {
+            bearingPushM = NAV_REROUTE_BEARING_PUSH_M;
+          }
+        }
+      }
+    }
+
+    const forwardBaseM = Math.min(total, Math.max(safeAlong, lastTurn) + bearingPushM);
     const minAheadAlongM = Math.min(total, forwardBaseM + NAV_REROUTE_MIN_AHEAD_M);
     const maxAheadAlongM = Math.min(total, forwardBaseM + NAV_REROUTE_MAX_AHEAD_M);
 
@@ -5597,13 +5855,21 @@
         reason: 'maneuver',
         stepIndex: maneuver.stepIndex,
         stepType: maneuver.type,
+        bearingPushM: bearingPushM,
       };
     }
 
-    // Fallback: keine Manöver-Steps mehr in Reichweite — geometrisch nächster Punkt im engen
-    // Vorwärts-Fenster wählen, weiterhin strikt nach forwardBaseM.
-    const fbMin = Math.min(total, forwardBaseM + NAV_REROUTE_FALLBACK_MIN_AHEAD_M);
-    const fbMax = Math.min(total, forwardBaseM + NAV_REROUTE_FALLBACK_MAX_AHEAD_M);
+    // Fallback: Vorwärts-Fenster skaliert mit Cross-Track. Bei 50m Off-Track bleibt das alte
+    // 180-650-Fenster, bei 400m Off-Track wird daraus 240-960 — verhindert, dass das Rejoin-Ziel
+    // praktisch am User-Standort kleben bleibt.
+    const fbMin = Math.min(
+      total,
+      forwardBaseM + Math.max(NAV_REROUTE_FALLBACK_MIN_AHEAD_M, NAV_REROUTE_FALLBACK_MIN_FACTOR * crossTrackM)
+    );
+    const fbMax = Math.min(
+      total,
+      forwardBaseM + Math.max(NAV_REROUTE_FALLBACK_MAX_AHEAD_M, NAV_REROUTE_FALLBACK_MAX_FACTOR * crossTrackM)
+    );
     const fbAnchor = Math.min(total, forwardBaseM + 80);
     const currentLl = L.latLng(currentLat, currentLng);
     let geomAnchorIndex = -1;
@@ -5647,6 +5913,7 @@
       targetAlongM: cum[targetIndex],
       remainingM: Math.max(0, total - cum[targetIndex]),
       reason: 'geometric',
+      bearingPushM: bearingPushM,
     };
   }
 
@@ -6405,7 +6672,9 @@
     const target =
       session && session.target
         ? session.target
-        : pickOriginalRouteRejoinTarget(originalRoute, alongM, lat, lng, lastManeuverAlongM);
+        : pickOriginalRouteRejoinTarget(originalRoute, alongM, lat, lng, lastManeuverAlongM, {
+            crossTrackM: Number.isFinite(d.crossTrackM) ? d.crossTrackM : 0,
+          });
     if (!target || !Array.isArray(target.point) || target.point.length < 2 || target.remainingM < 20) {
       finishRerouteNav();
       return;
