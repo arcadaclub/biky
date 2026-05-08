@@ -3606,6 +3606,27 @@
       } else {
         this._routeAvgSpeedMs = null;
       }
+      // Rundkurs erkennen — entweder über roundtrip_mode oder geometrische Nähe Start↔Ende.
+      // Wichtig für die ETA: bei Rundkursen kann der initiale Snap fälschlich auf den
+      // Endpunkt der Polyline landen (Start≈Ende geometrisch identisch), wodurch alongM
+      // sofort ≈ total wäre. Wird in updateFromLatLng abgefangen.
+      const rtMode = data && typeof data.roundtrip_mode === 'string' ? data.roundtrip_mode : '';
+      const isLoopMode = rtMode === 'circle_loop' || rtMode === 'waypoints_loop';
+      let geometricallyClosed = false;
+      const g = data.geometry;
+      if (g.length >= 2) {
+        const start = g[0];
+        const end = g[g.length - 1];
+        if (Array.isArray(start) && Array.isArray(end)) {
+          const dStartEnd = this.Lref.distance(
+            { lat: Number(start[0]), lng: Number(start[1]) },
+            { lat: Number(end[0]), lng: Number(end[1]) }
+          );
+          geometricallyClosed = Number.isFinite(dStartEnd) && dStartEnd < 30;
+        }
+      }
+      const tempRejoin = !!(data && (data._nrTemporaryRejoin || data._nrReturnToStart));
+      this._isRoundtripRoute = !tempRejoin && (isLoopMode || geometricallyClosed);
       if (this.isNavActive()) {
         // Bei Umleitungen/Route-Restore springt die Along-Meter-Skala. Teilkilometer bleiben, nur Referenz neu setzen.
         this._fitnessLastAlongM = null;
@@ -4326,18 +4347,34 @@
           statEta.textContent = '—';
         } else {
           const totalRouteM = this.cumDist[this.cumDist.length - 1] || 0;
-          const remainingM = Math.max(0, totalRouteM - (along || 0));
+          const traveledM = this._distanceTraveledM || 0;
+
+          // Fortschritt für die ETA bestimmen. Bei Rundkursen ist Start ≈ Ende geometrisch
+          // identisch — der initiale (globale) Snap kann fälschlich auf den Endpunkt der
+          // Polyline landen. Erst wenn echte Bewegung vorliegt (>80 m gefahren), vertrauen
+          // wir dem Snap. Davor: kompletter Rundkurs steht noch bevor.
+          let progressM;
+          if (this._isRoundtripRoute && traveledM < 80) {
+            progressM = 0;
+          } else {
+            // Monoton steigender Fortschritt: max(snap, höchster bisheriger, letzte Abbiegung)
+            // — verhindert ETA-Sprünge zurück bei kurzfristigem Snap-Wackeln.
+            progressM = Math.max(
+              along || 0,
+              this._maxAlongMeters || 0,
+              this._lastPassedManeuverAlongM || 0
+            );
+          }
+          const remainingM = Math.max(0, totalRouteM - progressM);
+
           const elapsedMs = Date.now() - (this._navStartedAtMs || Date.now());
           // Mischung aus ORS-Routenschnitt und live gefahrenem Schnitt:
           //  - vor 30 s und unter 100 m: ORS-Schätzung (Live noch zu rauschig).
           //  - danach: 60 % live + 40 % ORS, damit Unterschiede zur ORS-Schätzung
           //    (Pause, Steigung, Gegenwind) realistisch ins ETA durchschlagen.
           let vEff = this._routeAvgSpeedMs || null;
-          if (
-            (this._distanceTraveledM || 0) > 100 &&
-            elapsedMs > 30000
-          ) {
-            const vTraveled = (this._distanceTraveledM || 0) / (elapsedMs / 1000);
+          if (traveledM > 100 && elapsedMs > 30000) {
+            const vTraveled = traveledM / (elapsedMs / 1000);
             if (vTraveled > 0.4) {
               vEff = this._routeAvgSpeedMs ? 0.6 * vTraveled + 0.4 * this._routeAvgSpeedMs : vTraveled;
             }
