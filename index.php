@@ -139,13 +139,13 @@ if (is_file($appJsPath)) {
     <link rel="stylesheet" href="<?= htmlspecialchars($appCssHref, ENT_QUOTES, 'UTF-8') ?>">
     <link rel="modulepreload" href="<?= htmlspecialchars($nrBasePath, ENT_QUOTES, 'UTF-8') ?>/assets/vendor/piper-tts-web/piper-tts-web.js">
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js" defer></script>
-    <title>Biky v2.2</title>
+    <title>Biky v2.5</title>
 </head>
 <body>
     <?php if (!$currentUser): ?>
     <div id="login-screen" class="login-screen" role="dialog" aria-modal="true" aria-labelledby="login-screen-title">
         <div class="login-screen-card">
-            <h1 class="login-screen-brand">Biky <span class="brand-version">v2.2</span></h1>
+            <h1 class="login-screen-brand">Biky <span class="brand-version">v2.5</span></h1>
             <h2 id="login-screen-title" class="login-screen-title">Anmelden</h2>
             <p class="login-screen-copy"><?= $nrWordPressAuth
                 ? 'Melden Sie sich mit Ihrem Club-Konto (WordPress) an.'
@@ -168,7 +168,7 @@ if (is_file($appJsPath)) {
                 <div class="top-bar-brand-slot">
                     <h1 class="brand">
                         <button type="button" id="btn-brand-reload" class="brand-reload" aria-label="Seite neu laden">
-                            Biky <span class="brand-version">v2.2</span>
+                            Biky <span class="brand-version">v2.5</span>
                         </button>
                     </h1>
                 </div>
