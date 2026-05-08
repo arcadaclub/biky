@@ -191,7 +191,6 @@ if (is_file($appJsPath)) {
             <div class="top-bar-actions">
                 <button type="button" id="btn-panel-feedback" class="btn btn-primary btn-mini">Feedback</button>
                 <button type="button" id="btn-changelog" class="btn btn-ghost" aria-haspopup="dialog" aria-controls="changelog-dialog">Changelog</button>
-                <a class="btn btn-ghost" href="info/" aria-label="Info-Seite zu Biky öffnen">Info</a>
                 <button type="button" id="btn-top-routing-profile" class="btn btn-ghost top-bar-action-profile" aria-haspopup="dialog" aria-controls="profile-dialog">Routingprofil</button>
                 <button type="button" id="btn-settings" class="btn btn-ghost" aria-haspopup="dialog" aria-controls="settings-dialog">Einstellungen</button>
                 <button type="button" id="btn-konto" class="btn btn-ghost" aria-haspopup="dialog" aria-controls="konto-dialog">Konto</button>
@@ -746,6 +745,34 @@ if (is_file($appJsPath)) {
             <div class="auth-dialog-card changelog-card" role="dialog" aria-modal="true" aria-labelledby="changelog-title" aria-describedby="changelog-body">
                 <h2 id="changelog-title" class="auth-dialog-title">Was ist neu?</h2>
                 <div id="changelog-body" class="changelog-body" role="region" aria-label="Letzte Aenderungen" tabindex="0">
+                    <div class="changelog-day">
+                        <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.5</div>
+                        <ul class="changelog-list">
+                            <li><strong>Rückführung zur Route ist deutlich klüger:</strong> Die App reagiert jetzt schneller, wenn du klar von der Strecke abgekommen bist, und wartet entspannter, wenn du nur knapp neben der Linie fährst. Schwellenwerte passen sich automatisch an deine Geschwindigkeit an – Rennradfahrer bekommen mehr Toleranz, langsame Fahrer engere.</li>
+                            <li>Wenn du in die <strong>Gegenrichtung</strong> fährst, schiebt Biky den Wiedereinstieg auf der geplanten Strecke nach vorne. So wird kein unnötiger U-Turn auf den letzten Metern erzwungen.</li>
+                            <li>Bei großem Abstand zur Strecke wird das <strong>Wiedereinstiegs-Fenster</strong> automatisch weiter gesetzt, damit das Ziel sinnvoll vor dir liegt und nicht direkt am aktuellen Standort klebt.</li>
+                            <li>Der <strong>Cooldown</strong> zwischen zwei Rückführungs-Anfragen ist jetzt kürzer, wenn du wirklich weit weg bist – du fährst nicht mehr 14 Sekunden lang in die falsche Richtung.</li>
+                            <li>Sackgassen-Bereinigung im Rundkurs: Die App erkennt, wenn die Neuberechnung dieselbe Sackgasse wieder produziert, und bricht sauber ab. Wenn die Neuberechnung schlechter wäre als die geschnittene Variante, wird sie verworfen.</li>
+                            <li>Rund um die Schnittstellen werden <strong>Sperrzonen</strong> gesetzt, damit der Wiederaufbau der Schleife nicht direkt wieder durch die geschnittene Stelle läuft.</li>
+                            <li>Info-Button aus der Kopfzeile entfernt – die Funktion ist über andere Wege erreichbar.</li>
+                            <li>Begrüßung beim Seitenstart wird zuverlässig nur noch <strong>einmal</strong> gesprochen (vorher konnte sie unter ungünstigen Timing-Bedingungen doppelt kommen).</li>
+                        </ul>
+                    </div>
+                    <div class="changelog-day">
+                        <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.4</div>
+                        <ul class="changelog-list">
+                            <li>Bessere <strong>Sackgassen-Erkennung</strong>: Echte Schleifen und rechtwinklige Abbiegungen werden nicht mehr fälschlich als Sackgasse markiert. Lange Sackgassen-Stiche bei großen Touren (30 km +) werden zuverlässig erkannt.</li>
+                            <li>Schnellere Erkennung bei langen Routen durch optimierte Nachbar-Suche.</li>
+                            <li>Rundkurs-Berechnung früher fertig: Wenn die erste Variante schon gut ist, werden teure Zusatz-Anfragen an den Routing-Server eingespart – weniger Wartezeit, weniger Server-Limits.</li>
+                            <li>Mehr Treffer im Cache, weil identische Berechnungen jetzt unabhängig von der gewählten Varianten-Anzahl wiederverwendet werden.</li>
+                        </ul>
+                    </div>
+                    <div class="changelog-day">
+                        <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.3</div>
+                        <ul class="changelog-list">
+                            <li>Erste Veröffentlichung des Projekts auf GitHub als Code-Stand für Versions-Pflege und Nachvollziehbarkeit der Änderungen.</li>
+                        </ul>
+                    </div>
                     <div class="changelog-day">
                         <div class="changelog-day-date"><strong>7. Mai 2026</strong> · Version 2.2</div>
                         <ul class="changelog-list">

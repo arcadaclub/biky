@@ -7404,19 +7404,32 @@
 
     if (enginePref === 'system') {
       // System-TTS: keine Modelle laden. Autoplay ist oft blockiert; außerdem laden Voices teils verzögert.
+      let systemSpeakInFlight = false;
       const speakSystem = function () {
+        if (window.__nrAnyWelcomeDone) {
+          window.__nrPiperPageGreetInFlight = false;
+          return;
+        }
+        if (systemSpeakInFlight) {
+          return;
+        }
+        systemSpeakInFlight = true;
         let didSpeak = false;
         try {
           if (typeof window.speechSynthesis === 'undefined') {
             return;
           }
-          // Voices anstoßen (manche Browser liefern Voice-Liste erst später).
           try {
             void window.speechSynthesis.getVoices();
           } catch (eVoices) {
             /* ignore */
           }
           const doSpeak = function () {
+            // Erneuter Idempotenz-Check: Begrüßung könnte zwischenzeitlich von anderer Stelle
+            // (z. B. NRNavigation.speakWelcomeForNavigation) bereits gesprochen worden sein.
+            if (window.__nrAnyWelcomeDone) {
+              return;
+            }
             try {
               const u = new SpeechSynthesisUtterance(String(phrase));
               u.lang = 'de-DE';
@@ -7425,14 +7438,12 @@
               window.speechSynthesis.cancel();
               window.speechSynthesis.speak(u);
               didSpeak = true;
-              // Begrüßung erst als "verbraucht" markieren, wenn speak() tatsächlich aufgerufen wurde.
               window.__nrPiperPageGreetDone = true;
               window.__nrAnyWelcomeDone = true;
             } catch (eSpeak) {
               didSpeak = false;
             }
           };
-          // Wenn Voices noch leer sind, kurz warten (max ~800ms), dann sprechen.
           let voices = [];
           try {
             voices = window.speechSynthesis.getVoices() || [];
@@ -7465,8 +7476,7 @@
           window.setTimeout(finish, 800);
         } finally {
           window.__nrPiperPageGreetInFlight = false;
-          // Wenn System-TTS nicht gesprochen hat, Flags nicht "verbrauchen",
-          // damit ein späterer Trigger (z. B. nach User-Geste) erneut versuchen kann.
+          systemSpeakInFlight = false;
           if (!didSpeak) {
             try {
               window.__nrPiperPageGreetDone = false;
@@ -7531,17 +7541,14 @@
     }
 
     function trySpeakOnce() {
-      if (greetedDone) {
+      if (greetedDone || window.__nrAnyWelcomeDone) {
         return true;
       }
       if (speakInFlight) {
         return true;
       }
       const p = window.NRPiperTTS;
-      const has = !!p;
-      const hasPrepare = !!(p && typeof p.prepareNavTts === 'function');
-      const hasSpeak = !!(p && typeof p.speak === 'function');
-      if (!p || !hasPrepare || !hasSpeak) {
+      if (!p || typeof p.prepareNavTts !== 'function' || typeof p.speak !== 'function') {
         return false;
       }
       // Ohne User-Geste ist autoplay oft blockiert. Vermeidet Doppel-Ansage:
@@ -7555,63 +7562,51 @@
       } catch (eUa) {
         // falls userActivation nicht verfügbar ist, weiter versuchen (altes Verhalten).
       }
+      // SOFORT die In-Flight-Sperre setzen — bevor irgendein Promise startet, sonst können
+      // parallele trySpeakOnce-Aufrufe (ready-Event + User-Geste + Direkt-Aufruf) jeweils
+      // ein eigenes prepareNavTts().speak() lostreten und die Begrüßung mehrfach abfeuern.
+      speakInFlight = true;
       if (typeof p.setVolume === 'function') {
         p.setVolume(volume);
       }
-      // Warmstart: Session/Model laden, dann sprechen.
-      const t0 = Date.now();
-      // Wenn bereits vorgewärmt wird, zuerst darauf warten.
+      const finishSuccess = function (used) {
+        window.__nrPiperPageGreetInFlight = false;
+        speakInFlight = false;
+        if (used) {
+          greetedDone = true;
+          window.__nrPiperPageGreetDone = true;
+          window.__nrAnyWelcomeDone = true;
+        }
+      };
+      const finishFailure = function () {
+        window.__nrPiperPageGreetInFlight = false;
+        speakInFlight = false;
+      };
+      const launch = function () {
+        // Nochmal prüfen, falls inzwischen eine andere Stelle (z. B. Nav-Welcome) gesprochen hat.
+        if (greetedDone || window.__nrAnyWelcomeDone) {
+          finishFailure();
+          return;
+        }
+        void p
+          .prepareNavTts()
+          .then(function (ok) {
+            if (!ok) {
+              return false;
+            }
+            if (greetedDone || window.__nrAnyWelcomeDone) {
+              return false;
+            }
+            return p.speak(phrase, { kind: 'mile', volume: volume });
+          })
+          .then(finishSuccess)
+          .catch(finishFailure);
+      };
       if (prewarmPromise) {
-        void prewarmPromise.finally(function () {
-          void p
-            .prepareNavTts()
-            .then(function (ok) {
-              if (!ok) {
-                return false;
-              }
-              speakInFlight = true;
-              return p.speak(phrase, { kind: 'mile', volume: volume });
-            })
-            .then(function (used) {
-              window.__nrPiperPageGreetInFlight = false;
-              speakInFlight = false;
-              if (used) {
-                greetedDone = true;
-                // Begrüßung erst nach tatsächlich genutzter Ausgabe als "verbraucht" markieren.
-                window.__nrPiperPageGreetDone = true;
-                window.__nrAnyWelcomeDone = true;
-              }
-            })
-            .catch(function (err) {
-              window.__nrPiperPageGreetInFlight = false;
-              speakInFlight = false;
-            });
-        });
-        return true;
+        void prewarmPromise.finally(launch);
+      } else {
+        launch();
       }
-      void p
-        .prepareNavTts()
-        .then(function (ok) {
-          if (!ok) {
-            return false;
-          }
-          speakInFlight = true;
-          return p.speak(phrase, { kind: 'mile', volume: volume });
-        })
-        .then(function (used) {
-          window.__nrPiperPageGreetInFlight = false;
-          speakInFlight = false;
-          if (used) {
-            greetedDone = true;
-            // Begrüßung erst nach tatsächlich genutzter Ausgabe als "verbraucht" markieren.
-            window.__nrPiperPageGreetDone = true;
-            window.__nrAnyWelcomeDone = true;
-          }
-        })
-        .catch(function (err) {
-          window.__nrPiperPageGreetInFlight = false;
-          speakInFlight = false;
-        });
       return true;
     }
 
