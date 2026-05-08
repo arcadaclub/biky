@@ -1,0 +1,22 @@
+# MAMP/Apache: WebAssembly-Streaming verlangt application/wasm (sonst ORT/Piper-Fehler in der Konsole).
+<IfModule mod_mime.c>
+  AddType application/wasm wasm
+</IfModule>
+
+<IfModule mod_headers.c>
+  <FilesMatch "^(index\.php|auth_reset\.php|auth_verify\.php)$">
+    Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+    Header set Pragma "no-cache"
+    Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+  </FilesMatch>
+  <FilesMatch "\.(?:css|js|webmanifest)$">
+    Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+    Header set Pragma "no-cache"
+    Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+  </FilesMatch>
+
+  # Piper / ONNX Assets: groß, versioniert (Pfad) → aggressiv cachen für schnelle Aktivierung nach Reload
+  <FilesMatch "\.(?:wasm|data|onnx|json|bin)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+</IfModule>

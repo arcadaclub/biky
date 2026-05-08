@@ -1,0 +1,8 @@
+config/config.local.php
+private/db.local.php
+cache/*
+!cache/.gitkeep
+.DS_Store
+node_modules/
+.claude/
+Unbenannte Datei.txt

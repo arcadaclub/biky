@@ -1,0 +1,22 @@
+{
+  "name": "biketour",
+  "version": "2.3.0",
+  "description": "Webbasierte Fahrrad-Navigation mit OpenStreetMap, Leaflet und OpenRouteService (Routing über PHP-Backend), inklusive Natur-/Asphalt-Anteilen, GPX-Export, Höhenprofil und responsiver UI.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "vendor:piper": "node scripts/copy-piper-vendor.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@diffusionstudio/piper-wasm": "^1.0.0",
+    "@mintplex-labs/piper-tts-web": "^1.0.4",
+    "onnxruntime-web": "^1.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}

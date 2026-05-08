@@ -1,0 +1,19 @@
+{
+  "name": "Arcada-Club Biky",
+  "short_name": "Biky",
+  "version": "2.2",
+  "description": "Naturnahe Fahrradrouten mit OpenStreetMap",
+  "start_url": "./index.php",
+  "display": "standalone",
+  "background_color": "#0f2418",
+  "theme_color": "#1a4d2e",
+  "lang": "de",
+  "icons": [
+    {
+      "src": "assets/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
