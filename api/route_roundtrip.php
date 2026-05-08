@@ -141,8 +141,13 @@ for ($i = 1; $i <= $variants; $i++) {
     $rotationDeg = ($i - 1) * (360.0 / max(1, $variants));
     $rotationDeg = fmod($rotationDeg + $rotationOffsetDeg, 360.0);
 
+    /**
+     * `rotationDeg` wird aus (variants, $i, $rotationOffsetDeg) abgeleitet — daher reicht es als Schlüssel,
+     * `vt`, `vi` und `rot_off` müssen nicht zusätzlich rein. So treffen identische Effektiv-Rotationen
+     * den Cache, auch wenn der User die Variantenzahl ändert.
+     */
     $cachePayload = [
-        'mode' => 'circle_loop_v21',
+        'mode' => 'circle_loop_v24',
         'user_id' => (int) $user['id'],
         'ors_key_hash' => hash('sha256', $apiKey),
         'base_url' => $baseUrl,
@@ -151,11 +156,8 @@ for ($i = 1; $i <= $variants; $i++) {
         'd' => round($targetDistanceKm, 4),
         'r' => round($radiusKm, 4),
         'p' => $profil,
-        'vi' => $i,
         'n' => $nLoop,
         'rot' => round($rotationDeg, 4),
-        'vt' => $variants,
-        'rot_off' => round($rotationOffsetDeg, 4),
     ];
     $cacheKey = 'route_rt_' . hash('sha256', json_encode($cachePayload, JSON_THROW_ON_ERROR));
     $cacheFile = dirname(__DIR__) . '/cache/' . $cacheKey . '.json';
@@ -259,6 +261,11 @@ function nr_rt_build_variant_route(
     int $variantIndex
 ): array {
     $plan = nr_rt_profile_plan($profil);
+
+    /**
+     * Erst die "billige" Phase routen und sofort prüfen, ob sie die strict-Qualität schon erreicht
+     * — spart die teuren ORS-Calls der adaptiven/secondary Phasen, wenn primary bereits passt.
+     */
     $primaryRoutes = nr_rt_collect_variant_candidates(
         $ors,
         $lat,
@@ -271,8 +278,20 @@ function nr_rt_build_variant_route(
         $variantIndex,
         $plan['primary_phase_offsets']
     );
-    $candidateRoutes = $primaryRoutes;
 
+    $earlyStrict = array_values(array_filter(
+        $primaryRoutes,
+        static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'strict')
+    ));
+    if ($earlyStrict !== []) {
+        return nr_rt_attach_quality_meta(
+            nr_rt_pick_best_candidate($earlyStrict, $targetDistanceKm, $profil),
+            'strict',
+            $targetDistanceKm
+        );
+    }
+
+    $candidateRoutes = $primaryRoutes;
     $bestPrimary = nr_rt_pick_best_candidate($primaryRoutes, $targetDistanceKm, $profil);
     $adaptiveRadiusM = nr_rt_adaptive_radius_m($bestPrimary, $radiusM, $targetDistanceKm);
     if ($adaptiveRadiusM !== null) {
@@ -288,19 +307,18 @@ function nr_rt_build_variant_route(
             $variantIndex,
             $plan['primary_phase_offsets']
         );
+        $strictAdaptive = array_values(array_filter(
+            $adaptiveRoutes,
+            static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'strict')
+        ));
+        if ($strictAdaptive !== []) {
+            return nr_rt_attach_quality_meta(
+                nr_rt_pick_best_candidate($strictAdaptive, $targetDistanceKm, $profil),
+                'strict',
+                $targetDistanceKm
+            );
+        }
         $candidateRoutes = array_merge($candidateRoutes, $adaptiveRoutes);
-    }
-
-    $strictPrimary = array_values(array_filter(
-        $candidateRoutes,
-        static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'strict')
-    ));
-    if ($strictPrimary !== []) {
-        return nr_rt_attach_quality_meta(
-            nr_rt_pick_best_candidate($strictPrimary, $targetDistanceKm, $profil),
-            'strict',
-            $targetDistanceKm
-        );
     }
 
     $fallbackRoutes = nr_rt_collect_variant_candidates(
@@ -317,40 +335,18 @@ function nr_rt_build_variant_route(
     );
     $candidateRoutes = array_merge($candidateRoutes, $fallbackRoutes);
 
-    $acceptableRoutes = array_values(array_filter(
-        $candidateRoutes,
-        static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'strict')
-    ));
-    if ($acceptableRoutes !== []) {
-        return nr_rt_attach_quality_meta(
-            nr_rt_pick_best_candidate($acceptableRoutes, $targetDistanceKm, $profil),
-            'strict',
-            $targetDistanceKm
-        );
-    }
-
-    $relaxedRoutes = array_values(array_filter(
-        $candidateRoutes,
-        static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'relaxed')
-    ));
-    if ($relaxedRoutes !== []) {
-        return nr_rt_attach_quality_meta(
-            nr_rt_pick_best_candidate($relaxedRoutes, $targetDistanceKm, $profil),
-            'relaxed',
-            $targetDistanceKm
-        );
-    }
-
-    $fallbackRoutes = array_values(array_filter(
-        $candidateRoutes,
-        static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, 'fallback')
-    ));
-    if ($fallbackRoutes !== []) {
-        return nr_rt_attach_quality_meta(
-            nr_rt_pick_best_candidate($fallbackRoutes, $targetDistanceKm, $profil),
-            'fallback',
-            $targetDistanceKm
-        );
+    foreach (['strict', 'relaxed', 'fallback'] as $level) {
+        $matching = array_values(array_filter(
+            $candidateRoutes,
+            static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, $level)
+        ));
+        if ($matching !== []) {
+            return nr_rt_attach_quality_meta(
+                nr_rt_pick_best_candidate($matching, $targetDistanceKm, $profil),
+                $level,
+                $targetDistanceKm
+            );
+        }
     }
 
     if ($candidateRoutes !== []) {
@@ -607,7 +603,7 @@ function nr_rt_profile_style_delta(array $route, string $profil): float
  */
 function nr_rt_dead_end_spike_ratio(array $geometry, ?array $precomputedSpikes = null): float
 {
-    $samples = nr_rt_sample_polyline_with_distance($geometry, 28.0);
+    $samples = nr_rt_sample_polyline_with_distance($geometry, 24.0);
     if (count($samples) < 8) {
         return 0.0;
     }
@@ -617,31 +613,58 @@ function nr_rt_dead_end_spike_ratio(array $geometry, ?array $precomputedSpikes =
 }
 
 /**
+ * Hin-und-zurück-Äste: Anchor → Punkt mit gleicher Position nach kurzer Pfadstrecke,
+ * dazwischen ein klar entferntes Maximum, und die beiden Hälften verlaufen räumlich
+ * gespiegelt (Mirror-Check) — sonst würden 90°-Kreuzungen oder Schleifen fälschlich als Spike zählen.
+ *
  * @param list<array{0: float, 1: float}> $geometry
  * @return list<array{anchor_path_m: float, return_path_m: float, path_delta_m: float, max_away_m: float}>
  */
 function nr_rt_dead_end_spikes(array $geometry): array
 {
-    $samples = nr_rt_sample_polyline_with_distance($geometry, 28.0);
+    $stepM = 24.0;
+    $samples = nr_rt_sample_polyline_with_distance($geometry, $stepM);
     $count = count($samples);
     if ($count < 8) {
         return [];
     }
 
+    // Schwellwerte skalieren mit Routenlänge: bei 30 km echte 700-m-Sackgassen-Stiche, bei 5 km nur kurze.
+    $totalLengthM = $samples[$count - 1][2];
+    $maxAwayCap = nr_rt_clamp(0.045 * $totalLengthM, 320.0, 1100.0);
+    $maxPathDeltaM = nr_rt_clamp(0.18 * $totalLengthM, 800.0, 3200.0);
+    $minPathDeltaM = 90.0;
+    $maxReturnDistM = 32.0;
+    $minAwayM = 50.0;
+    $minMirrorSamples = 4;
+    $avgMirrorDistMax = 18.0;
+    $maxMirrorDistMax = 32.0;
+
+    $grid = nr_rt_build_spatial_grid($samples, $maxReturnDistM * 2.5);
     $spikes = [];
-    for ($i = 0; $i < $count; $i++) {
+
+    $i = 0;
+    while ($i < $count) {
         $anchor = $samples[$i];
-        for ($j = $i + 1; $j < $count; $j++) {
-            $pathDelta = $samples[$j][2] - $anchor[2];
-            if ($pathDelta < 140.0) {
+        $candidate = null;
+
+        $neighborIdx = nr_rt_query_grid_within($grid, $anchor[0], $anchor[1], $maxReturnDistM);
+        sort($neighborIdx, SORT_NUMERIC);
+
+        foreach ($neighborIdx as $j) {
+            if ($j <= $i) {
                 continue;
             }
-            if ($pathDelta > 1350.0) {
+            $pathDelta = $samples[$j][2] - $anchor[2];
+            if ($pathDelta < $minPathDeltaM) {
+                continue;
+            }
+            if ($pathDelta > $maxPathDeltaM) {
                 break;
             }
 
             $returnDistanceM = nr_rt_haversine_m($anchor[0], $anchor[1], $samples[$j][0], $samples[$j][1]);
-            if ($returnDistanceM > 28.0) {
+            if ($returnDistanceM > $maxReturnDistM) {
                 continue;
             }
 
@@ -652,22 +675,153 @@ function nr_rt_dead_end_spikes(array $geometry): array
                     $maxAwayM = $awayM;
                 }
             }
+            if ($maxAwayM < $minAwayM || $maxAwayM > $maxAwayCap) {
+                continue;
+            }
 
-            // Obere Grenze erhöht: breitere Wohngebiet-Umwege (Parallelstraßen) als Spike erkennen
-            if ($maxAwayM >= 70.0 && $maxAwayM <= 480.0) {
-                $spikes[] = [
-                    'anchor_path_m' => $anchor[2],
-                    'return_path_m' => $samples[$j][2],
-                    'path_delta_m' => $pathDelta,
-                    'max_away_m' => $maxAwayM,
-                ];
-                $i = min($j, $count - 1);
-                break;
+            $mirror = nr_rt_mirror_overlap_stats($samples, $i, $j);
+            if (
+                $mirror === null
+                || $mirror['count'] < $minMirrorSamples
+                || $mirror['avg'] > $avgMirrorDistMax
+                || $mirror['max'] > $maxMirrorDistMax
+            ) {
+                continue;
+            }
+
+            $candidate = [
+                'anchor_path_m' => $anchor[2],
+                'return_path_m' => $samples[$j][2],
+                'path_delta_m' => $pathDelta,
+                'max_away_m' => $maxAwayM,
+                'next_i' => $j,
+            ];
+            break;
+        }
+
+        if ($candidate !== null) {
+            $spikes[] = [
+                'anchor_path_m' => $candidate['anchor_path_m'],
+                'return_path_m' => $candidate['return_path_m'],
+                'path_delta_m' => $candidate['path_delta_m'],
+                'max_away_m' => $candidate['max_away_m'],
+            ];
+            $i = $candidate['next_i'] + 1;
+            continue;
+        }
+        $i++;
+    }
+
+    return $spikes;
+}
+
+/**
+ * Räumlicher Hash-Grid: O(1)-Lookup von Samples in einer Umgebung statt O(N²) im Detector.
+ * Zellen-Kanten werden so gewählt, dass `nr_rt_query_grid_within(... $maxM)` in 1–2 Zellen-Reach
+ * alle Treffer findet.
+ *
+ * @param list<array{0: float, 1: float, 2: float}> $samples
+ * @return array{cells: array<string, list<int>>, cellLatDeg: float, cellLonDeg: float, refLatRad: float, latPerDeg: float, lonPerDeg: float}
+ */
+function nr_rt_build_spatial_grid(array $samples, float $cellM): array
+{
+    $cellM = max(8.0, $cellM);
+    if ($samples === []) {
+        return [
+            'cells' => [],
+            'cellLatDeg' => $cellM / 111320.0,
+            'cellLonDeg' => $cellM / 111320.0,
+            'refLatRad' => 0.0,
+            'latPerDeg' => 111320.0,
+            'lonPerDeg' => 111320.0,
+        ];
+    }
+    $refLat = $samples[0][0];
+    $latPerDeg = 111320.0;
+    $lonPerDeg = max(1.0, 111320.0 * cos(deg2rad($refLat)));
+    $cellLatDeg = max(1e-7, $cellM / $latPerDeg);
+    $cellLonDeg = max(1e-7, $cellM / $lonPerDeg);
+    $cells = [];
+    foreach ($samples as $idx => $s) {
+        $cx = (int) floor($s[1] / $cellLonDeg);
+        $cy = (int) floor($s[0] / $cellLatDeg);
+        $key = $cx . ':' . $cy;
+        $cells[$key][] = $idx;
+    }
+
+    return [
+        'cells' => $cells,
+        'cellLatDeg' => $cellLatDeg,
+        'cellLonDeg' => $cellLonDeg,
+        'refLatRad' => deg2rad($refLat),
+        'latPerDeg' => $latPerDeg,
+        'lonPerDeg' => $lonPerDeg,
+    ];
+}
+
+/**
+ * @param array{cells: array<string, list<int>>, cellLatDeg: float, cellLonDeg: float, refLatRad: float, latPerDeg: float, lonPerDeg: float} $grid
+ * @return list<int>
+ */
+function nr_rt_query_grid_within(array $grid, float $lat, float $lon, float $maxM): array
+{
+    if ($grid['cells'] === []) {
+        return [];
+    }
+    $cx = (int) floor($lon / $grid['cellLonDeg']);
+    $cy = (int) floor($lat / $grid['cellLatDeg']);
+    $reachY = (int) max(1, ceil($maxM / max(1.0, $grid['cellLatDeg'] * $grid['latPerDeg'])));
+    $reachX = (int) max(1, ceil($maxM / max(1.0, $grid['cellLonDeg'] * $grid['lonPerDeg'])));
+    $out = [];
+    for ($dy = -$reachY; $dy <= $reachY; $dy++) {
+        for ($dx = -$reachX; $dx <= $reachX; $dx++) {
+            $key = ($cx + $dx) . ':' . ($cy + $dy);
+            if (isset($grid['cells'][$key])) {
+                foreach ($grid['cells'][$key] as $idx) {
+                    $out[] = $idx;
+                }
             }
         }
     }
 
-    return $spikes;
+    return $out;
+}
+
+/**
+ * Hin- und Rückweg eines Spike-Kandidaten verlaufen gespiegelt um den Mittelpunkt:
+ * sample[i+t] sollte räumlich nah an sample[j-t] liegen. So werden echte Sackgassen-Stiche
+ * von rundlichen Schleifen (Kreuzungen, Wohngebiete) unterschieden.
+ *
+ * @param list<array{0: float, 1: float, 2: float}> $samples
+ * @return array{count: int, avg: float, max: float}|null
+ */
+function nr_rt_mirror_overlap_stats(array $samples, int $i, int $j): ?array
+{
+    $half = (int) floor(($j - $i) / 2);
+    if ($half < 2) {
+        return null;
+    }
+    $count = 0;
+    $sum = 0.0;
+    $max = 0.0;
+    for ($t = 1; $t <= $half; $t++) {
+        $left = $samples[$i + $t] ?? null;
+        $right = $samples[$j - $t] ?? null;
+        if ($left === null || $right === null) {
+            break;
+        }
+        $d = nr_rt_haversine_m($left[0], $left[1], $right[0], $right[1]);
+        $sum += $d;
+        if ($d > $max) {
+            $max = $d;
+        }
+        $count++;
+    }
+    if ($count === 0) {
+        return null;
+    }
+
+    return ['count' => $count, 'avg' => $sum / $count, 'max' => $max];
 }
 
 /**
@@ -710,12 +864,15 @@ function nr_rt_self_overlap_ratio(
         return 0.0;
     }
 
+    $grid = nr_rt_build_spatial_grid($samples, $nearPointThresholdM * 2.5);
     $overlaps = 0;
-    $eligible = 0;
     for ($i = 0; $i < $count; $i++) {
         $a = $samples[$i];
-        $eligible++;
-        for ($j = $i + 1; $j < $count; $j++) {
+        $candidates = nr_rt_query_grid_within($grid, $a[0], $a[1], $nearPointThresholdM);
+        foreach ($candidates as $j) {
+            if ($j <= $i) {
+                continue;
+            }
             $pathDelta = abs($samples[$j][2] - $a[2]);
             if ($pathDelta < $minPathSeparationM) {
                 continue;
@@ -727,7 +884,7 @@ function nr_rt_self_overlap_ratio(
         }
     }
 
-    return $eligible > 0 ? $overlaps / $eligible : 0.0;
+    return $count > 0 ? $overlaps / $count : 0.0;
 }
 
 function nr_rt_route_quality_ok(array $route, float $targetDistanceKm, string $level = 'strict'): bool

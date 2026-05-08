@@ -737,45 +737,88 @@
   }
 
   /**
-   * Konservative Sackgassen-Erkennung:
-   * gesucht werden Abschnitte, die an fast denselben Punkt zurückkehren UND
-   * deren Hin- und Rückweg sich über weite Strecken decken.
+   * Sackgassen-Erkennung (single-pass): Hin-und-zurück-Äste, die räumlich gespiegelt verlaufen.
+   * Schwellwerte skalieren mit Routenlänge — bei 30-km-Touren dürfen Stiche länger sein als bei 5 km.
+   * Spatial-Hash-Grid macht den Return-Lookup O(N) statt O(N²).
    */
-  const NR_OUT_AND_BACK_PRESETS = [
-    {
-      stepM: 18,
-      minPathDelta: 90,
-      maxPathDelta: 2200,
-      maxReturnDist: 34,
-      minAway: 38,
-      maxAway: 820,
-      minMirrorSamples: 4,
-      avgMirrorDistMax: 16,
-      maxMirrorDistMax: 28,
-    },
-    {
-      stepM: 14,
-      minPathDelta: 54,
-      maxPathDelta: 2600,
-      maxReturnDist: 46,
-      minAway: 24,
-      maxAway: 980,
-      minMirrorSamples: 5,
-      avgMirrorDistMax: 20,
-      maxMirrorDistMax: 36,
-    },
-    {
-      stepM: 11,
-      minPathDelta: 36,
-      maxPathDelta: 3200,
-      maxReturnDist: 58,
-      minAway: 16,
-      maxAway: 1200,
-      minMirrorSamples: 6,
-      avgMirrorDistMax: 24,
-      maxMirrorDistMax: 44,
-    },
-  ];
+  const NR_OUT_AND_BACK_CONFIG = {
+    stepM: 14,
+    minPathDelta: 70,
+    pathDeltaFraction: 0.18,
+    pathDeltaMin: 800,
+    pathDeltaMax: 3200,
+    maxReturnDist: 42,
+    minAway: 30,
+    awayFraction: 0.045,
+    awayCapMin: 320,
+    awayCapMax: 1100,
+    minMirrorSamples: 4,
+    avgMirrorDistMax: 20,
+    maxMirrorDistMax: 36,
+    clusterPathM: 54,
+  };
+
+  function nrClampNum(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  /**
+   * Räumlicher Hash-Grid: O(1)-Lookup von Samples in einer Umgebung statt O(N²).
+   * Zellengröße ≈ Suchradius × 2,5 → eine 1-Zellen-Reach-Suche deckt den Suchradius ab.
+   */
+  function nrBuildSpatialGrid(samples, cellM) {
+    const safeCellM = Math.max(8, cellM);
+    if (!samples || samples.length === 0) {
+      return {
+        cells: new Map(),
+        cellLatDeg: safeCellM / 111320,
+        cellLonDeg: safeCellM / 111320,
+        latPerDeg: 111320,
+        lonPerDeg: 111320,
+      };
+    }
+    const refLat = samples[0][0];
+    const latPerDeg = 111320;
+    const lonPerDeg = Math.max(1, 111320 * Math.cos((refLat * Math.PI) / 180));
+    const cellLatDeg = Math.max(1e-7, safeCellM / latPerDeg);
+    const cellLonDeg = Math.max(1e-7, safeCellM / lonPerDeg);
+    const cells = new Map();
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const cx = Math.floor(s[1] / cellLonDeg);
+      const cy = Math.floor(s[0] / cellLatDeg);
+      const key = cx + ':' + cy;
+      const bucket = cells.get(key);
+      if (bucket) {
+        bucket.push(i);
+      } else {
+        cells.set(key, [i]);
+      }
+    }
+    return { cells: cells, cellLatDeg: cellLatDeg, cellLonDeg: cellLonDeg, latPerDeg: latPerDeg, lonPerDeg: lonPerDeg };
+  }
+
+  function nrQueryGridWithin(grid, lat, lon, maxM) {
+    if (!grid.cells || grid.cells.size === 0) {
+      return [];
+    }
+    const cx = Math.floor(lon / grid.cellLonDeg);
+    const cy = Math.floor(lat / grid.cellLatDeg);
+    const reachY = Math.max(1, Math.ceil(maxM / Math.max(1, grid.cellLatDeg * grid.latPerDeg)));
+    const reachX = Math.max(1, Math.ceil(maxM / Math.max(1, grid.cellLonDeg * grid.lonPerDeg)));
+    const out = [];
+    for (let dy = -reachY; dy <= reachY; dy++) {
+      for (let dx = -reachX; dx <= reachX; dx++) {
+        const bucket = grid.cells.get(cx + dx + ':' + (cy + dy));
+        if (bucket) {
+          for (let i = 0; i < bucket.length; i++) {
+            out.push(bucket[i]);
+          }
+        }
+      }
+    }
+    return out;
+  }
 
   function nrMirrorOverlapStats(samples, i, j) {
     const half = Math.floor((j - i) / 2);
@@ -801,35 +844,48 @@
     if (count === 0) {
       return null;
     }
-    return {
-      count: count,
-      avgDist: sum / count,
-      maxDist: maxDist,
-    };
+    return { count: count, avgDist: sum / count, maxDist: maxDist };
   }
 
-  function nrFindOutAndBackSegmentsWithParams(geometry, p) {
-    const samples = nrSamplePolylineWithDistance(geometry, p.stepM);
+  function nrFindOutAndBackSegmentsSinglePass(geometry, cfg) {
+    const samples = nrSamplePolylineWithDistance(geometry, cfg.stepM);
     const count = samples.length;
-    if (count < p.minMirrorSamples + 3) {
+    if (count < cfg.minMirrorSamples + 3) {
       return [];
     }
+
+    const totalLengthM = samples[count - 1][2];
+    const maxAwayCap = nrClampNum(cfg.awayFraction * totalLengthM, cfg.awayCapMin, cfg.awayCapMax);
+    const maxPathDelta = nrClampNum(cfg.pathDeltaFraction * totalLengthM, cfg.pathDeltaMin, cfg.pathDeltaMax);
+    const grid = nrBuildSpatialGrid(samples, cfg.maxReturnDist * 2.5);
     const segments = [];
-    for (let i = 0; i < count; i++) {
+
+    let i = 0;
+    while (i < count) {
       const anchor = samples[i];
-      for (let j = i + 1; j < count; j++) {
-        const pathDelta = samples[j][2] - anchor[2];
-        if (pathDelta < p.minPathDelta) {
+      const neighbors = nrQueryGridWithin(grid, anchor[0], anchor[1], cfg.maxReturnDist);
+      neighbors.sort(function (a, b) {
+        return a - b;
+      });
+
+      let candidate = null;
+      for (let n = 0; n < neighbors.length; n++) {
+        const j = neighbors[n];
+        if (j <= i) {
           continue;
         }
-        if (pathDelta > p.maxPathDelta) {
+        const pathDelta = samples[j][2] - anchor[2];
+        if (pathDelta < cfg.minPathDelta) {
+          continue;
+        }
+        if (pathDelta > maxPathDelta) {
           break;
         }
         const returnDist = map.distance(
           L.latLng(anchor[0], anchor[1]),
           L.latLng(samples[j][0], samples[j][1])
         );
-        if (returnDist > p.maxReturnDist) {
+        if (returnDist > cfg.maxReturnDist) {
           continue;
         }
         let maxAway = 0;
@@ -842,19 +898,19 @@
             maxAway = away;
           }
         }
-        if (maxAway < p.minAway || maxAway > p.maxAway) {
+        if (maxAway < cfg.minAway || maxAway > maxAwayCap) {
           continue;
         }
         const overlap = nrMirrorOverlapStats(samples, i, j);
         if (
           !overlap ||
-          overlap.count < p.minMirrorSamples ||
-          overlap.avgDist > p.avgMirrorDistMax ||
-          overlap.maxDist > p.maxMirrorDistMax
+          overlap.count < cfg.minMirrorSamples ||
+          overlap.avgDist > cfg.avgMirrorDistMax ||
+          overlap.maxDist > cfg.maxMirrorDistMax
         ) {
           continue;
         }
-        segments.push({
+        candidate = {
           start_path_m: anchor[2],
           end_path_m: samples[j][2],
           path_delta_m: pathDelta,
@@ -863,11 +919,28 @@
           overlap_count: overlap.count,
           avg_mirror_dist_m: overlap.avgDist,
           max_mirror_dist_m: overlap.maxDist,
-        });
-        i = Math.min(j - 1, count - 1);
+          next_i: j,
+        };
         break;
       }
+
+      if (candidate) {
+        segments.push({
+          start_path_m: candidate.start_path_m,
+          end_path_m: candidate.end_path_m,
+          path_delta_m: candidate.path_delta_m,
+          return_dist_m: candidate.return_dist_m,
+          max_away_m: candidate.max_away_m,
+          overlap_count: candidate.overlap_count,
+          avg_mirror_dist_m: candidate.avg_mirror_dist_m,
+          max_mirror_dist_m: candidate.max_mirror_dist_m,
+        });
+        i = candidate.next_i + 1;
+        continue;
+      }
+      i++;
     }
+
     return segments;
   }
 
@@ -946,13 +1019,8 @@
   }
 
   function nrFindReliableNoExitSegments(geometry) {
-    const all = [];
-    NR_OUT_AND_BACK_PRESETS.forEach(function (preset) {
-      nrFindOutAndBackSegmentsWithParams(geometry, preset).forEach(function (s) {
-        all.push(s);
-      });
-    });
-    return mergeOutAndBackSegments(all, 54);
+    const segments = nrFindOutAndBackSegmentsSinglePass(geometry, NR_OUT_AND_BACK_CONFIG);
+    return mergeOutAndBackSegments(segments, NR_OUT_AND_BACK_CONFIG.clusterPathM);
   }
 
   function nrGeometrySliceByPathMeters(geometry, cumDist, fromM, toM) {
