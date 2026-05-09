@@ -77,6 +77,9 @@ function nr_db_ensure_schema(PDO $pdo): void
             password_hash VARCHAR(255) NOT NULL,
             email_verified_at TIMESTAMP NULL DEFAULT NULL,
             fitness_points INT UNSIGNED NOT NULL DEFAULT 0,
+            total_kilometers DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            total_routes INT UNSIGNED NOT NULL DEFAULT 0,
+            total_navigation_time INT UNSIGNED NOT NULL DEFAULT 0,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_nr_users_email (email)
@@ -97,6 +100,24 @@ function nr_db_ensure_schema(PDO $pdo): void
         'nr_users',
         'fitness_points',
         'ALTER TABLE nr_users ADD COLUMN fitness_points INT UNSIGNED NOT NULL DEFAULT 0 AFTER email_verified_at'
+    );
+    nr_db_ensure_column(
+        $pdo,
+        'nr_users',
+        'total_kilometers',
+        'ALTER TABLE nr_users ADD COLUMN total_kilometers DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER fitness_points'
+    );
+    nr_db_ensure_column(
+        $pdo,
+        'nr_users',
+        'total_routes',
+        'ALTER TABLE nr_users ADD COLUMN total_routes INT UNSIGNED NOT NULL DEFAULT 0 AFTER total_kilometers'
+    );
+    nr_db_ensure_column(
+        $pdo,
+        'nr_users',
+        'total_navigation_time',
+        'ALTER TABLE nr_users ADD COLUMN total_navigation_time INT UNSIGNED NOT NULL DEFAULT 0 AFTER total_routes'
     );
 
     $pdo->exec(
@@ -178,6 +199,26 @@ function nr_db_ensure_schema(PDO $pdo): void
                 ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
     );
+
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS nr_user_route_history (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT UNSIGNED NOT NULL,
+            route_date DATETIME NOT NULL,
+            route_day DATE NOT NULL,
+            distance_km DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+            duration_minutes INT UNSIGNED DEFAULT NULL,
+            route_type VARCHAR(40) NOT NULL DEFAULT "",
+            start_location VARCHAR(255) NOT NULL DEFAULT "",
+            end_location VARCHAR(255) NOT NULL DEFAULT "",
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY idx_nr_user_route_history_user_day (user_id, route_day),
+            KEY idx_nr_user_route_history_user_date (user_id, route_date),
+            CONSTRAINT fk_nr_user_route_history_user
+                FOREIGN KEY (user_id) REFERENCES nr_users(id)
+                ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+    );
 }
 
 function nr_db_ensure_column(PDO $pdo, string $table, string $column, string $alterSql): bool
@@ -201,7 +242,7 @@ function nr_db_ensure_column(PDO $pdo, string $table, string $column, string $al
 
 /**
  * @param array<string, mixed> $row
- * @return array{id:int,email:string,display_name:string,fitness_points:int}
+ * @return array{id:int,email:string,display_name:string,fitness_points:int,total_kilometers:float,total_routes:int,total_navigation_time:int}
  */
 function nr_auth_public_user(array $row): array
 {
@@ -210,17 +251,29 @@ function nr_auth_public_user(array $row): array
     $fitnessPoints = isset($row['fitness_points']) && is_numeric($row['fitness_points'])
         ? max(0, (int) $row['fitness_points'])
         : 0;
+    $totalKilometers = isset($row['total_kilometers']) && is_numeric($row['total_kilometers'])
+        ? max(0.0, round((float) $row['total_kilometers'], 2))
+        : 0.0;
+    $totalRoutes = isset($row['total_routes']) && is_numeric($row['total_routes'])
+        ? max(0, (int) $row['total_routes'])
+        : 0;
+    $totalNavigationTime = isset($row['total_navigation_time']) && is_numeric($row['total_navigation_time'])
+        ? max(0, (int) $row['total_navigation_time'])
+        : 0;
 
     return [
         'id' => (int) ($row['id'] ?? 0),
         'email' => $email,
         'display_name' => $displayName !== '' ? $displayName : $email,
         'fitness_points' => $fitnessPoints,
+        'total_kilometers' => $totalKilometers,
+        'total_routes' => $totalRoutes,
+        'total_navigation_time' => $totalNavigationTime,
     ];
 }
 
 /**
- * @return array{id:int,email:string,display_name:string,fitness_points:int}|null
+ * @return array{id:int,email:string,display_name:string,fitness_points:int,total_kilometers:float,total_routes:int,total_navigation_time:int}|null
  */
 function nr_auth_current_user(): ?array
 {
@@ -235,6 +288,15 @@ function nr_auth_current_user(): ?array
     $fitnessPoints = isset($user['fitness_points']) && is_numeric($user['fitness_points'])
         ? max(0, (int) $user['fitness_points'])
         : 0;
+    $totalKilometers = isset($user['total_kilometers']) && is_numeric($user['total_kilometers'])
+        ? max(0.0, round((float) $user['total_kilometers'], 2))
+        : 0.0;
+    $totalRoutes = isset($user['total_routes']) && is_numeric($user['total_routes'])
+        ? max(0, (int) $user['total_routes'])
+        : 0;
+    $totalNavigationTime = isset($user['total_navigation_time']) && is_numeric($user['total_navigation_time'])
+        ? max(0, (int) $user['total_navigation_time'])
+        : 0;
     if ($id <= 0 || $email === '') {
         return null;
     }
@@ -244,11 +306,14 @@ function nr_auth_current_user(): ?array
         'email' => $email,
         'display_name' => $displayName !== '' ? $displayName : $email,
         'fitness_points' => $fitnessPoints,
+        'total_kilometers' => $totalKilometers,
+        'total_routes' => $totalRoutes,
+        'total_navigation_time' => $totalNavigationTime,
     ];
 }
 
 /**
- * @param array{id:int,email:string,display_name:string,fitness_points?:int} $user
+ * @param array{id:int,email:string,display_name:string,fitness_points?:int,total_kilometers?:float,total_routes?:int,total_navigation_time?:int} $user
  */
 function nr_auth_set_user(array $user): void
 {
@@ -257,12 +322,35 @@ function nr_auth_set_user(array $user): void
     if (session_status() === PHP_SESSION_ACTIVE) {
         session_regenerate_id(true);
     }
-    $_SESSION['nr_user'] = [
+    $_SESSION['nr_user'] = nr_auth_session_user_payload($user);
+}
+
+/**
+ * @param array{id:int,email:string,display_name:string,fitness_points?:int,total_kilometers?:float,total_routes?:int,total_navigation_time?:int} $user
+ * @return array{id:int,email:string,display_name:string,fitness_points:int,total_kilometers:float,total_routes:int,total_navigation_time:int}
+ */
+function nr_auth_session_user_payload(array $user): array
+{
+    return [
         'id' => (int) $user['id'],
         'email' => (string) $user['email'],
         'display_name' => (string) $user['display_name'],
         'fitness_points' => isset($user['fitness_points']) ? max(0, (int) $user['fitness_points']) : 0,
+        'total_kilometers' => isset($user['total_kilometers']) ? max(0.0, round((float) $user['total_kilometers'], 2)) : 0.0,
+        'total_routes' => isset($user['total_routes']) ? max(0, (int) $user['total_routes']) : 0,
+        'total_navigation_time' => isset($user['total_navigation_time']) ? max(0, (int) $user['total_navigation_time']) : 0,
     ];
+}
+
+/**
+ * @param array{id:int,email:string,display_name:string,fitness_points:int,total_kilometers:float,total_routes:int,total_navigation_time:int} $publicUser
+ */
+function nr_auth_refresh_session_user_if_current(int $userId, array $publicUser): void
+{
+    nr_session_start();
+    if (isset($_SESSION['nr_user']) && is_array($_SESSION['nr_user']) && (int) ($_SESSION['nr_user']['id'] ?? 0) === $userId) {
+        $_SESSION['nr_user'] = nr_auth_session_user_payload($publicUser);
+    }
 }
 
 function nr_auth_logout(): void
@@ -295,7 +383,7 @@ function nr_auth_normalize_settings(array $data): array
         }
         if ($key === 'lastProfile' && is_string($data[$key])) {
             $p = strtolower(trim($data[$key]));
-            if (in_array($p, ['natur', 'gravel', 'ruhig', 'abenteuer', 'radwege'], true)) {
+            if (in_array($p, ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege'], true)) {
                 $out['lastProfile'] = $p;
             }
             continue;
@@ -919,12 +1007,202 @@ function nr_auth_add_fitness_points(PDO $pdo, int $userId, int $delta): array
         throw new RuntimeException('Benutzer nicht gefunden.');
     }
     $publicUser = nr_auth_public_user($user);
-    nr_session_start();
-    if (isset($_SESSION['nr_user']) && is_array($_SESSION['nr_user']) && (int) ($_SESSION['nr_user']['id'] ?? 0) === $userId) {
-        $_SESSION['nr_user'] = $publicUser;
-    }
+    nr_auth_refresh_session_user_if_current($userId, $publicUser);
 
     return $publicUser;
+}
+
+function nr_user_route_history_timezone(): DateTimeZone
+{
+    static $tz = null;
+    if ($tz instanceof DateTimeZone) {
+        return $tz;
+    }
+    $tz = new DateTimeZone('Europe/Berlin');
+
+    return $tz;
+}
+
+function nr_user_route_history_normalize_text(mixed $value, int $maxLen = 255): string
+{
+    if (!is_scalar($value)) {
+        return '';
+    }
+    $text = trim((string) $value);
+    if ($text === '') {
+        return '';
+    }
+    $text = preg_replace('/\s+/u', ' ', $text) ?? $text;
+    if ($maxLen > 0 && mb_strlen($text) > $maxLen) {
+        $text = mb_substr($text, 0, $maxLen);
+    }
+
+    return $text;
+}
+
+/**
+ * @param array<string, mixed> $payload
+ * @return array{id:int,email:string,display_name:string,fitness_points:int,total_kilometers:float,total_routes:int,total_navigation_time:int}
+ */
+function nr_user_record_completed_route(PDO $pdo, int $userId, array $payload): array
+{
+    if ($userId <= 0) {
+        throw new RuntimeException('Ungültiger Benutzer.');
+    }
+
+    $distanceKm = isset($payload['distance_km']) && is_numeric($payload['distance_km'])
+        ? round((float) $payload['distance_km'], 2)
+        : 0.0;
+    if ($distanceKm <= 0.0 || $distanceKm > 99999.99) {
+        throw new RuntimeException('Ungültige Distanz.');
+    }
+
+    $durationMinutes = null;
+    if (array_key_exists('duration_minutes', $payload) && $payload['duration_minutes'] !== null && $payload['duration_minutes'] !== '') {
+        if (!is_numeric($payload['duration_minutes'])) {
+            throw new RuntimeException('Ungültige Dauer.');
+        }
+        $durationMinutes = max(0, min(1000000, (int) round((float) $payload['duration_minutes'])));
+    }
+
+    $routeType = nr_user_route_history_normalize_text($payload['route_type'] ?? '', 40);
+    $startLocation = nr_user_route_history_normalize_text($payload['start_location'] ?? '', 255);
+    $endLocation = nr_user_route_history_normalize_text($payload['end_location'] ?? '', 255);
+    $nowLocal = new DateTimeImmutable('now', nr_user_route_history_timezone());
+    $routeDate = $nowLocal->format('Y-m-d H:i:s');
+    $routeDay = $nowLocal->format('Y-m-d');
+    $durationDelta = $durationMinutes ?? 0;
+
+    $pdo->beginTransaction();
+    try {
+        $ins = $pdo->prepare(
+            'INSERT INTO nr_user_route_history
+                (user_id, route_date, route_day, distance_km, duration_minutes, route_type, start_location, end_location)
+             VALUES
+                (:user_id, :route_date, :route_day, :distance_km, :duration_minutes, :route_type, :start_location, :end_location)'
+        );
+        $ins->execute([
+            'user_id' => $userId,
+            'route_date' => $routeDate,
+            'route_day' => $routeDay,
+            'distance_km' => $distanceKm,
+            'duration_minutes' => $durationMinutes,
+            'route_type' => $routeType,
+            'start_location' => $startLocation,
+            'end_location' => $endLocation,
+        ]);
+
+        $upd = $pdo->prepare(
+            'UPDATE nr_users
+             SET total_kilometers = LEAST(99999999.99, total_kilometers + :distance_km),
+                 total_routes = LEAST(4294967295, total_routes + 1),
+                 total_navigation_time = LEAST(4294967295, total_navigation_time + :duration_minutes)
+             WHERE id = :id'
+        );
+        $upd->execute([
+            'distance_km' => $distanceKm,
+            'duration_minutes' => $durationDelta,
+            'id' => $userId,
+        ]);
+
+        $user = nr_auth_find_user_by_id($pdo, $userId);
+        if ($user === null) {
+            throw new RuntimeException('Benutzer nicht gefunden.');
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+
+    $publicUser = nr_auth_public_user($user);
+    nr_auth_refresh_session_user_if_current($userId, $publicUser);
+
+    return $publicUser;
+}
+
+/**
+ * @return array{start:DateTimeImmutable,end:DateTimeImmutable}
+ */
+function nr_user_route_history_week_bounds(?string $weekStart = null): array
+{
+    $tz = nr_user_route_history_timezone();
+    if ($weekStart !== null && trim($weekStart) !== '') {
+        $base = DateTimeImmutable::createFromFormat('!Y-m-d', trim($weekStart), $tz);
+        if (!$base instanceof DateTimeImmutable) {
+            throw new RuntimeException('Ungültiger Wochenstart.');
+        }
+    } else {
+        $base = new DateTimeImmutable('now', $tz);
+    }
+
+    $start = $base->setTime(0, 0)->modify('monday this week');
+    $end = $start->modify('+6 days');
+
+    return ['start' => $start, 'end' => $end];
+}
+
+/**
+ * @return array{
+ *   week_start:string,
+ *   week_end:string,
+ *   days:list<array{date:string,weekday_iso:int,distance_km:float}>
+ * }
+ */
+function nr_user_route_history_week_stats(PDO $pdo, int $userId, ?string $weekStart = null): array
+{
+    if ($userId <= 0) {
+        throw new RuntimeException('Ungültiger Benutzer.');
+    }
+
+    $bounds = nr_user_route_history_week_bounds($weekStart);
+    $start = $bounds['start'];
+    $end = $bounds['end'];
+
+    $stmt = $pdo->prepare(
+        'SELECT route_day, ROUND(SUM(distance_km), 2) AS distance_km
+         FROM nr_user_route_history
+         WHERE user_id = :user_id
+           AND route_day BETWEEN :start_day AND :end_day
+         GROUP BY route_day
+         ORDER BY route_day ASC'
+    );
+    $stmt->execute([
+        'user_id' => $userId,
+        'start_day' => $start->format('Y-m-d'),
+        'end_day' => $end->format('Y-m-d'),
+    ]);
+
+    $rawRows = $stmt->fetchAll();
+    $distanceByDay = [];
+    foreach ($rawRows as $row) {
+        $day = isset($row['route_day']) ? (string) $row['route_day'] : '';
+        if ($day === '') {
+            continue;
+        }
+        $distanceByDay[$day] = isset($row['distance_km']) && is_numeric($row['distance_km'])
+            ? max(0.0, round((float) $row['distance_km'], 2))
+            : 0.0;
+    }
+
+    $days = [];
+    for ($i = 0; $i < 7; $i++) {
+        $day = $start->modify('+' . $i . ' days');
+        $dayKey = $day->format('Y-m-d');
+        $days[] = [
+            'date' => $dayKey,
+            'weekday_iso' => $i + 1,
+            'distance_km' => $distanceByDay[$dayKey] ?? 0.0,
+        ];
+    }
+
+    return [
+        'week_start' => $start->format('Y-m-d'),
+        'week_end' => $end->format('Y-m-d'),
+        'days' => $days,
+    ];
 }
 
 function nr_auth_resend_verification(PDO $pdo, string $email): void

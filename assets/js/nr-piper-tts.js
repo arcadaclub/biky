@@ -51,6 +51,7 @@ let currentVolume = 1;
 let activeSpeakJob = null;
 let pendingSpeakJob = null;
 let speakJobSeq = 0;
+let autoplayUnlockBound = false;
 
 function clampVolume(value) {
   const n = Number(value);
@@ -215,6 +216,37 @@ function primeAudioPlayback() {
   } catch (e2) {
     /* ignorieren */
   }
+}
+
+function bindAutoplayUnlockOnce() {
+  if (autoplayUnlockBound) {
+    return;
+  }
+  autoplayUnlockBound = true;
+  const unlock = function () {
+    try {
+      primeAudioPlayback();
+    } catch (e) {
+      /* ignore */
+    }
+    cleanup();
+  };
+  const cleanup = function () {
+    ['pointerdown', 'touchstart', 'mousedown', 'keydown'].forEach(function (evt) {
+      try {
+        window.removeEventListener(evt, unlock, true);
+      } catch (e) {
+        /* ignore */
+      }
+    });
+  };
+  ['pointerdown', 'touchstart', 'mousedown', 'keydown'].forEach(function (evt) {
+    try {
+      window.addEventListener(evt, unlock, true);
+    } catch (e) {
+      /* ignore */
+    }
+  });
 }
 
 async function loadTtsModule() {
@@ -603,6 +635,7 @@ async function performSpeakJob(job) {
             msg.includes('user denied permission');
           if (blocked) {
             window.dispatchEvent(new CustomEvent('nr-piper-autoplay-blocked', { detail: { message: msg } }));
+        bindAutoplayUnlockOnce();
           }
         } catch (e0) {
           /* ignore */

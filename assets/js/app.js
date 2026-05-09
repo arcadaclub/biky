@@ -50,6 +50,8 @@
   async function fetchJsonWithTimeout(url, options, timeoutMs) {
     const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(1000, Number(timeoutMs)) : 60000;
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const externalSignal = options && options.signal ? options.signal : null;
+    let externalAbortHandler = null;
     const id = window.setTimeout(function () {
       if (ctrl) {
         try {
@@ -61,15 +63,49 @@
     }, ms);
     try {
       const opts = Object.assign({}, options || {});
+      if (ctrl && externalSignal && externalSignal.aborted) {
+        try {
+          ctrl.abort();
+        } catch (e0) {
+          /* ignore */
+        }
+      }
+      if (ctrl && externalSignal && typeof externalSignal.addEventListener === 'function') {
+        externalAbortHandler = function () {
+          try {
+            ctrl.abort();
+          } catch (e0) {
+            /* ignore */
+          }
+        };
+        externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+      }
       if (ctrl) {
         opts.signal = ctrl.signal;
+      } else if (externalSignal) {
+        opts.signal = externalSignal;
       }
       return await fetchJson(url, opts);
     } catch (e) {
-      const msg = e && e.name === 'AbortError' ? 'Timeout: Server antwortet nicht rechtzeitig.' : e && e.message ? e.message : String(e);
+      const abortedByUser = !!(externalSignal && externalSignal.aborted);
+      const msg =
+        e && e.name === 'AbortError'
+          ? abortedByUser
+            ? 'Abgebrochen.'
+            : 'Timeout: Server antwortet nicht rechtzeitig.'
+          : e && e.message
+            ? e.message
+            : String(e);
       throw new Error(msg);
     } finally {
       window.clearTimeout(id);
+      if (
+        externalSignal &&
+        externalAbortHandler &&
+        typeof externalSignal.removeEventListener === 'function'
+      ) {
+        externalSignal.removeEventListener('abort', externalAbortHandler);
+      }
     }
   }
 
@@ -149,6 +185,15 @@
   const panelUserSummary = document.getElementById('panel-user-summary');
   const panelUserName = document.getElementById('panel-user-name');
   const panelFitnessPoints = document.getElementById('panel-fitness-points');
+  const kontoStatsPanel = document.getElementById('konto-stats-panel');
+  const kontoTotalKilometers = document.getElementById('konto-total-kilometers');
+  const kontoTotalRoutes = document.getElementById('konto-total-routes');
+  const kontoTotalNavTime = document.getElementById('konto-total-nav-time');
+  const kontoStatsWeekLabel = document.getElementById('konto-stats-week-label');
+  const kontoStatsWeekSubtitle = document.getElementById('konto-stats-week-subtitle');
+  const kontoStatsChart = document.getElementById('konto-stats-chart');
+  const kontoStatsPrevWeek = document.getElementById('konto-stats-prev-week');
+  const kontoStatsNextWeek = document.getElementById('konto-stats-next-week');
   const topBarUserMeta = document.getElementById('top-bar-user-meta');
   const topBarUserName = document.getElementById('top-bar-user-name');
   const topBarFitnessPoints = document.getElementById('top-bar-fitness-points');
@@ -464,7 +509,7 @@
     lastRoute: null,
     /** @type {array|null} zuletzt berechnete Rundkurs-Varianten (volle Route-Payloads) */
     roundtripVariants: null,
-    /** @type {L.LatLng[]} Entwurf Wegpunkte für Rundkurs-Modus „Wegpunkte“ (max. 10) */
+    /** @type {L.LatLng[]} Entwurf Wegpunkte für Rundkurs-Modus „Wegpunkte” (max. 10) */
     rtWaypoints: [],
     /** Klick auf Route: Teilstrecke per Alternativrouting ersetzen */
     /** OpenStreetMap noexit (Weg oder Knoten) als rote Overlays */
@@ -475,9 +520,15 @@
       window.NR_USER && typeof window.NR_USER === 'object' && window.NR_USER.id
         ? window.NR_USER
         : null,
+    routeHistoryWeekStart: null,
+    routeHistoryStats: null,
+    routeHistoryLoading: false,
+    routeHistorySaveInFlight: false,
     /** Route-Busy Overlay: wenn true, nur "Abbrechen" anzeigen (kein Nav-Start). */
     _nrRouteBusyCancelOnly: false,
   };
+  const roundtripCleanCache = new Map();
+  const ROUNDTRIP_CLEAN_CACHE_LIMIT = 24;
 
   const NOEXIT_MIN_ZOOM = 12;
   const ROUTE_REMOVE_MAX_CLICK_M = 58;
@@ -1235,6 +1286,40 @@
     return dedupeNavStepsProgressiveWayEnd(mapped);
   }
 
+  /**
+   * Punkt auf der Polyline an einer bestimmten Pfaddistanz interpolieren.
+   * Liefert immer einen Punkt direkt auf einer realen Wegstrecke — keine Luftlinie.
+   */
+  function nrInterpolateAtPathMeters(geom, cum, targetM) {
+    if (!Array.isArray(geom) || geom.length < 2) {
+      return null;
+    }
+    const total = cum[cum.length - 1] || 0;
+    if (!Number.isFinite(targetM)) {
+      return null;
+    }
+    if (targetM <= 0) {
+      return [geom[0][0], geom[0][1]];
+    }
+    if (targetM >= total) {
+      return [geom[geom.length - 1][0], geom[geom.length - 1][1]];
+    }
+    for (let i = 1; i < geom.length; i++) {
+      if (cum[i] >= targetM) {
+        const segLen = cum[i] - cum[i - 1];
+        if (segLen <= 0.01) {
+          return [geom[i - 1][0], geom[i - 1][1]];
+        }
+        const t = (targetM - cum[i - 1]) / segLen;
+        return [
+          geom[i - 1][0] + (geom[i][0] - geom[i - 1][0]) * t,
+          geom[i - 1][1] + (geom[i][1] - geom[i - 1][1]) * t,
+        ];
+      }
+    }
+    return [geom[geom.length - 1][0], geom[geom.length - 1][1]];
+  }
+
   function removeDeadEndSegmentsFromGeometry(data, segments) {
     const geom = data && Array.isArray(data.geometry) ? data.geometry : null;
     if (!geom || geom.length < 6 || !segments || !segments.length) {
@@ -1248,7 +1333,12 @@
       lo = Math.max(1, lo);
       hi = Math.min(geom.length - 2, hi);
       if (hi > lo) {
-        ranges.push({ lo: lo, hi: hi });
+        // Statt den Cut zu verwerfen wenn die zwei Vertices um den Spike auseinanderliegen
+        // (was bei ORS-Geometrien mit wenig Stützpunkten oft so ist), interpolieren wir den
+        // Anchor-Punkt der Sackgasse. Der liegt per Definition auf der Original-Polyline und
+        // gibt eine reale Wegverbindung — keine Querlinie über die Karte.
+        const bridge = nrInterpolateAtPathMeters(geom, cum, segment.start_path_m);
+        ranges.push({ lo: lo, hi: hi, bridge: bridge });
       }
     });
     if (!ranges.length) {
@@ -1264,10 +1354,11 @@
     ranges.forEach(function (range) {
       const last = mergedRanges[mergedRanges.length - 1];
       if (!last || range.lo > last.hi + 1) {
-        mergedRanges.push({ lo: range.lo, hi: range.hi });
+        mergedRanges.push({ lo: range.lo, hi: range.hi, bridge: range.bridge });
         return;
       }
       last.hi = Math.max(last.hi, range.hi);
+      // Mehrere Spikes verschmolzen → erste Bridge-Position behalten (liegt am Anfang des Clusters).
     });
     let removedM = 0;
     mergedRanges.forEach(function (range) {
@@ -1283,8 +1374,20 @@
         return b.lo - a.lo;
       })
       .forEach(function (range) {
-        merged = merged.slice(0, range.lo).concat(merged.slice(range.hi + 1));
-        mergedOrigIdx = mergedOrigIdx.slice(0, range.lo).concat(mergedOrigIdx.slice(range.hi + 1));
+        // Anstelle der entfernten Spike-Vertices einen Bridge-Vertex am Sackgassen-Eintritt
+        // einsetzen, falls vorhanden. Der `coordNearM(2.5m)` weiter unten dedupliziert die
+        // Bridge, falls sie räumlich mit einem benachbarten Vertex zusammenfällt.
+        const before = merged.slice(0, range.lo);
+        const after = merged.slice(range.hi + 1);
+        const beforeIdx = mergedOrigIdx.slice(0, range.lo);
+        const afterIdx = mergedOrigIdx.slice(range.hi + 1);
+        if (range.bridge) {
+          merged = before.concat([range.bridge], after);
+          mergedOrigIdx = beforeIdx.concat([range.lo], afterIdx);
+        } else {
+          merged = before.concat(after);
+          mergedOrigIdx = beforeIdx.concat(afterIdx);
+        }
       });
     const cleaned = [];
     const origIndexPerCleanedVertex = [];
@@ -1528,7 +1631,48 @@
     return kept.length >= 3 ? kept : waypoints;
   }
 
-  async function rerouteCleanedLoopCandidate(candidate, sourceData, avoidZones) {
+  /**
+   * Spike-Avoid-Zonen (Punkt + Radius in Metern) → GeoJSON MultiPolygon (lon/lat).
+   * Pro Zone ein quadratisches Polygon mit Kantenlänge ≈ 2 × radius. ORS akzeptiert das
+   * als `options.avoid_polygons` und routet gar nicht erst dort durch.
+   */
+  function avoidZonesToGeoJsonMultiPolygon(zones) {
+    if (!Array.isArray(zones) || zones.length === 0) {
+      return null;
+    }
+    const polygons = [];
+    zones.forEach(function (zone) {
+      const lat = Number(zone && zone.lat);
+      const lng = Number(zone && zone.lng);
+      const radiusM = Number(zone && zone.radiusM);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radiusM) || radiusM <= 0) {
+        return;
+      }
+      const latPerM = 1 / 111320;
+      const lonPerM = 1 / Math.max(1, 111320 * Math.cos((lat * Math.PI) / 180));
+      const dLat = radiusM * latPerM;
+      const dLon = radiusM * lonPerM;
+      const south = lat - dLat;
+      const north = lat + dLat;
+      const west = lng - dLon;
+      const east = lng + dLon;
+      polygons.push([
+        [
+          [west, south],
+          [east, south],
+          [east, north],
+          [west, north],
+          [west, south],
+        ],
+      ]);
+    });
+    if (polygons.length === 0) {
+      return null;
+    }
+    return { type: 'MultiPolygon', coordinates: polygons };
+  }
+
+  async function rerouteCleanedLoopCandidate(candidate, sourceData, avoidZones, sampleCount) {
     if (!candidate || !Array.isArray(candidate.geometry) || candidate.geometry.length < 3) {
       return null;
     }
@@ -1540,7 +1684,10 @@
       rerouteMeta.waypoints.length >= 3
         ? rerouteMeta.waypoints
         : null;
-    let waypoints = originalWaypoints || sampleLoopWaypointsFromGeometry(candidate.geometry, 8);
+    const sampleN = Number.isFinite(Number(sampleCount)) && Number(sampleCount) >= 3
+      ? Math.max(3, Math.min(12, Math.floor(Number(sampleCount))))
+      : 8;
+    let waypoints = originalWaypoints || sampleLoopWaypointsFromGeometry(candidate.geometry, sampleN);
     // Original-Wegpunkte (User-Input) sind sakrosankt — nur generische Samples werden gefiltert.
     if (!originalWaypoints) {
       waypoints = filterWaypointsAvoidingZones(waypoints, avoidZones);
@@ -1553,6 +1700,10 @@
       waypoints: waypoints,
       profil: (rerouteMeta && rerouteMeta.profil) || currentProfile(),
     };
+    const avoidGeometry = avoidZonesToGeoJsonMultiPolygon(avoidZones);
+    if (avoidGeometry) {
+      body.avoid_polygons = avoidGeometry;
+    }
     const rerouted = await fetchJsonWithTimeout(
       apiUrl('api/route.php'),
       {
@@ -1571,84 +1722,218 @@
   }
 
   /**
-   * Nach jedem Schnitt können weitere Hin-und-zurück-Äste sichtbar werden, weil sich die
-   * Geometrie ändert. Mehrere Durchläufe ersetzen das bisher nötige manuelle Nachklicken.
+   * Sackgassen-Bereinigung in zwei Phasen:
    *
-   * Schutzmechanismen gegen Endlos-Pingpong:
-   * 1. Spike-Fingerprint: identische Sackgassen zweimal hintereinander → abbrechen.
-   * 2. Qualitäts-Check: wenn Reroute mehr Spikes erzeugt als die geschnittene Geometrie hatte,
-   *    wird das Reroute verworfen und die geschnittene Variante (ohne Reroute) zurückgegeben.
-   * 3. Distanz-Sanity: wenn Reroute die Strecke um >40 % gegen die geschnittene Geometrie
-   *    aufbläht, wird die geschnittene Variante bevorzugt.
+   * Phase 1 (Reroute-Phase): Cut + ORS-Reroute pro Pass. Solange das Reroute die Variante
+   * verbessert (weniger Spikes, Distanz nicht aufgebläht), wird die rerouteet Geometrie
+   * weiterverwendet — dadurch werden Sackgassen durch echte ORS-Wegfindung ersetzt.
+   *
+   * Phase 2 (Cut-Only): Wenn Reroute nicht mehr hilft (Fail, mehr Spikes, identische
+   * Sackgassen erneut), wird ohne ORS-Call weitergecutted. Der Bridge-Vertex
+   * (`removeDeadEndSegmentsFromGeometry`) hält die Geometrie auf der Original-Polyline
+   * stetig — also keine Querfahrten. Phase 2 läuft so lange, bis die Spike-Erkennung
+   * leer zurückgibt oder ein Hard-Cap erreicht wird.
+   *
+   * Damit verschwinden auch hartnäckige Sackgassen-Cluster (die ORS immer wieder anfährt),
+   * statt im Endergebnis rot markiert übrig zu bleiben.
    */
-  const ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT = 5;
+  const ROUNDTRIP_DEAD_END_REROUTE_PASSES = 3;
+  const ROUNDTRIP_DEAD_END_REROUTE_PASSES_FOLLOWUP = 2;
+  const ROUNDTRIP_DEAD_END_CUT_PASSES_MAX = 14;
+  // Backwards-compat: removeAutoDetectedDeadEndsFromRoute referenziert noch diesen Namen.
+  const ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT = ROUNDTRIP_DEAD_END_REROUTE_PASSES;
 
-  async function cleanRoundtripVariant(data, maxPasses) {
-    if (!data || !Array.isArray(data.geometry) || data.geometry.length < 6) {
-      return data;
+  function cloneRoundtripCacheValue(data) {
+    if (!data || typeof data !== 'object') {
+      return null;
     }
-    const passes =
-      Number.isFinite(Number(maxPasses)) && Number(maxPasses) > 0
-        ? Math.max(1, Math.min(ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT, Math.floor(Number(maxPasses))))
-        : ROUNDTRIP_DEAD_END_CLEAN_PASSES_DEFAULT;
-    let current = Object.assign({}, data);
-    let totalRemovedRanges = 0;
+    try {
+      return JSON.parse(JSON.stringify(data));
+    } catch (e0) {
+      return null;
+    }
+  }
+
+  function buildRoundtripCleanCacheKey(data, reroutePasses, rerouteWaypoints) {
+    if (!data || !Array.isArray(data.geometry) || data.geometry.length < 3) {
+      return '';
+    }
+    const geom = data.geometry;
+    const picks = [0, 0.25, 0.5, 0.75, 1].map(function (ratio) {
+      const idx = Math.max(0, Math.min(geom.length - 1, Math.round((geom.length - 1) * ratio)));
+      const pt = geom[idx];
+      if (!Array.isArray(pt) || pt.length < 2) {
+        return 'x';
+      }
+      return Number(pt[0]).toFixed(5) + ',' + Number(pt[1]).toFixed(5);
+    });
+    return [
+      'v2',
+      reroutePasses,
+      Number.isFinite(Number(rerouteWaypoints)) ? Number(rerouteWaypoints) : 8,
+      data.profil || '',
+      Number(data.distance || 0).toFixed(2),
+      data.roundtrip_direction || '',
+      Number(data.roundtrip_phase_offset_deg || 0).toFixed(2),
+      Number(data.roundtrip_spokes || 0),
+      picks.join(';'),
+    ].join('|');
+  }
+
+  function readRoundtripCleanCache(cacheKey) {
+    if (!cacheKey || !roundtripCleanCache.has(cacheKey)) {
+      return null;
+    }
+    const value = roundtripCleanCache.get(cacheKey);
+    roundtripCleanCache.delete(cacheKey);
+    roundtripCleanCache.set(cacheKey, value);
+    return cloneRoundtripCacheValue(value);
+  }
+
+  function writeRoundtripCleanCache(cacheKey, data) {
+    if (!cacheKey) {
+      return;
+    }
+    const cloned = cloneRoundtripCacheValue(data);
+    if (!cloned) {
+      return;
+    }
+    if (roundtripCleanCache.has(cacheKey)) {
+      roundtripCleanCache.delete(cacheKey);
+    }
+    roundtripCleanCache.set(cacheKey, cloned);
+    while (roundtripCleanCache.size > ROUNDTRIP_CLEAN_CACHE_LIMIT) {
+      const oldestKey = roundtripCleanCache.keys().next();
+      if (oldestKey && !oldestKey.done) {
+        roundtripCleanCache.delete(oldestKey.value);
+      } else {
+        break;
+      }
+    }
+  }
+
+  async function mapWithConcurrency(items, limit, worker) {
+    const arr = Array.isArray(items) ? items : [];
+    if (!arr.length) {
+      return [];
+    }
+    const maxWorkers = Math.max(1, Math.min(arr.length, Math.floor(Number(limit) || 1)));
+    const results = new Array(arr.length);
+    let nextIndex = 0;
+
+    async function runOne() {
+      while (nextIndex < arr.length) {
+        const idx = nextIndex++;
+        results[idx] = await worker(arr[idx], idx, arr);
+      }
+    }
+
+    const runners = [];
+    for (let i = 0; i < maxWorkers; i++) {
+      runners.push(runOne());
+    }
+    await Promise.all(runners);
+    return results;
+  }
+
+  function cutOnlyDeadEnds(data, maxPasses) {
+    let current = data;
+    let totalRemoved = 0;
     let lastFingerprint = '';
-    for (let pass = 0; pass < passes; pass++) {
+    for (let pass = 0; pass < maxPasses; pass++) {
       const segments = nrFindReliableNoExitSegments(current.geometry);
       if (!segments.length) {
-        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
+        break;
       }
       const fingerprint = spikeFingerprint(segments);
       if (fingerprint && fingerprint === lastFingerprint) {
-        // Identische Sackgassen wie im vorigen Pass → Reroute hat sie nicht beseitigt, weitere
-        // Iterationen sparen wir uns. Geschnittene Geometrie ist immer noch besser als das Original.
-        const cleanedFinal = removeDeadEndSegmentsFromGeometry(current, segments);
-        if (cleanedFinal) {
-          return Object.assign({}, cleanedFinal, {
-            dead_end_segments_removed: totalRemovedRanges + (cleanedFinal.dead_end_segments_removed || 0),
-            reroute_skipped_reason: 'spike_fingerprint_repeat',
-          });
-        }
-        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
+        // Cut hat die Spike-Form nicht verändert (z. B. Bridge-Vertex landet wieder so, dass
+        // die Spike-Detection denselben Bereich wieder markiert). Weiteres Cutten ändert nichts.
+        break;
+      }
+      lastFingerprint = fingerprint;
+      const next = removeDeadEndSegmentsFromGeometry(current, segments);
+      if (!next || !Array.isArray(next.geometry) || next.geometry.length < 3) {
+        break;
+      }
+      totalRemoved += next.dead_end_segments_removed || 0;
+      current = next;
+    }
+    return { data: current, removed: totalRemoved };
+  }
+
+  async function cleanRoundtripVariant(data, maxPasses, opts) {
+    if (!data || !Array.isArray(data.geometry) || data.geometry.length < 6) {
+      return data;
+    }
+    const reroutePasses =
+      Number.isFinite(Number(maxPasses)) && Number(maxPasses) > 0
+        ? Math.max(1, Math.min(ROUNDTRIP_DEAD_END_REROUTE_PASSES, Math.floor(Number(maxPasses))))
+        : ROUNDTRIP_DEAD_END_REROUTE_PASSES;
+    const rerouteWaypoints =
+      opts && Number.isFinite(Number(opts.rerouteWaypoints)) && Number(opts.rerouteWaypoints) >= 3
+        ? Math.max(3, Math.min(12, Math.floor(Number(opts.rerouteWaypoints))))
+        : 8;
+    const cacheKey = buildRoundtripCleanCacheKey(data, reroutePasses, rerouteWaypoints);
+    const cached = readRoundtripCleanCache(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    let current = Object.assign({}, data);
+    let totalRemovedRanges = 0;
+    let lastFingerprint = '';
+    let stopReason = null;
+
+    // ---- Phase 1: Cut + Reroute ----
+    for (let pass = 0; pass < reroutePasses; pass++) {
+      const segments = nrFindReliableNoExitSegments(current.geometry);
+      if (!segments.length) {
+        stopReason = 'no_more_spikes';
+        break;
+      }
+      const fingerprint = spikeFingerprint(segments);
+      if (fingerprint && fingerprint === lastFingerprint) {
+        stopReason = 'spike_fingerprint_repeat';
+        break;
       }
       lastFingerprint = fingerprint;
 
       const cleaned = removeDeadEndSegmentsFromGeometry(current, segments);
       if (!cleaned) {
-        return Object.assign({}, current, { dead_end_segments_removed: totalRemovedRanges });
+        stopReason = 'cut_failed';
+        break;
       }
 
       const avoidZones = buildSpikeAvoidZones(current.geometry, segments);
       let rerouted;
       try {
-        rerouted = await rerouteCleanedLoopCandidate(cleaned, current, avoidZones);
+        rerouted = await rerouteCleanedLoopCandidate(cleaned, current, avoidZones, rerouteWaypoints);
       } catch (err) {
-        // Reroute fehlgeschlagen — geschnittene Variante (ohne ORS-Roundtrip) ist immer noch besser.
-        return Object.assign({}, cleaned, {
-          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
-          reroute_failed: true,
-        });
+        // Reroute fehlgeschlagen — geschnittene Variante übernehmen, dann Phase 2 (Cut-Only).
+        totalRemovedRanges += cleaned.dead_end_segments_removed || 0;
+        current = Object.assign({}, cleaned, { dead_end_segments_removed: totalRemovedRanges });
+        stopReason = 'reroute_failed';
+        break;
       }
       if (!rerouted) {
-        return Object.assign({}, cleaned, {
-          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
-        });
+        totalRemovedRanges += cleaned.dead_end_segments_removed || 0;
+        current = Object.assign({}, cleaned, { dead_end_segments_removed: totalRemovedRanges });
+        stopReason = 'reroute_unavailable';
+        break;
       }
 
-      // Qualitäts-Vergleich: Reroute darf nicht mehr Spikes haben als die geschnittene Variante,
-      // sonst war der ORS-Call kontraproduktiv (typisch bei Sackgassen-Cluster, das ORS umfährt
-      // und dabei eine andere Sackgasse anschneidet).
       const reroutedSpikes = nrFindReliableNoExitSegments(rerouted.geometry);
       const cleanedSpikes = nrFindReliableNoExitSegments(cleaned.geometry);
       const cleanedDistKm = Number(cleaned.distance) || 0;
       const reroutedDistKm = Number(rerouted.distance) || 0;
       const distInflated = cleanedDistKm > 0.5 && reroutedDistKm > cleanedDistKm * 1.4;
       if (reroutedSpikes.length > cleanedSpikes.length || distInflated) {
-        return Object.assign({}, cleaned, {
-          dead_end_segments_removed: totalRemovedRanges + (cleaned.dead_end_segments_removed || 0),
-          reroute_rejected_reason: distInflated ? 'distance_inflated' : 'more_spikes_after_reroute',
-        });
+        // Reroute kontraproduktiv → geschnittene Variante übernehmen, dann Phase 2.
+        totalRemovedRanges += cleaned.dead_end_segments_removed || 0;
+        current = Object.assign({}, cleaned, { dead_end_segments_removed: totalRemovedRanges });
+        stopReason = distInflated ? 'distance_inflated' : 'more_spikes_after_reroute';
+        break;
       }
 
       totalRemovedRanges += cleaned.dead_end_segments_removed || 0;
@@ -1656,9 +1941,25 @@
         dead_end_segments_removed: totalRemovedRanges,
       });
     }
-    return Object.assign({}, current, {
+
+    // ---- Phase 2: Cut-Only (bis alle roten Segmente weg sind) ----
+    const remainingSegments = nrFindReliableNoExitSegments(current.geometry);
+    if (remainingSegments.length > 0) {
+      const cutResult = cutOnlyDeadEnds(current, ROUNDTRIP_DEAD_END_CUT_PASSES_MAX);
+      if (cutResult.data && cutResult.data !== current) {
+        totalRemovedRanges += cutResult.removed || 0;
+        current = Object.assign({}, cutResult.data, {
+          dead_end_segments_removed: totalRemovedRanges,
+        });
+      }
+    }
+
+    const result = Object.assign({}, current, {
       dead_end_segments_removed: totalRemovedRanges,
+      dead_end_clean_stop_reason: stopReason,
     });
+    writeRoundtripCleanCache(cacheKey, result);
+    return result;
   }
 
   function paintNoExitAlongRouteGeometry(geom) {
@@ -1944,6 +2245,23 @@
       });
       lastPatched = current;
     }
+
+    // Cut-Only-Nachklärung: falls noch rote Sackgassen-Markierungen übrig sind, ohne ORS-Call
+    // weiter cutten bis die Spike-Erkennung leer ist (Bridge-Vertex hält Geometrie stetig).
+    const baseForCutOnly = lastPatched || current;
+    if (baseForCutOnly && Array.isArray(baseForCutOnly.geometry)) {
+      const remainingSegments = nrFindReliableNoExitSegments(baseForCutOnly.geometry);
+      if (remainingSegments.length > 0) {
+        const cutResult = cutOnlyDeadEnds(baseForCutOnly, ROUNDTRIP_DEAD_END_CUT_PASSES_MAX);
+        if (cutResult.data && cutResult.data !== baseForCutOnly) {
+          totalRemovedRanges += cutResult.removed || 0;
+          lastPatched = Object.assign({}, cutResult.data, {
+            dead_end_segments_removed: totalRemovedRanges,
+          });
+        }
+      }
+    }
+
     if (!lastPatched) {
       if (routeInfo) {
         const tried = nrFindReliableNoExitSegments(data.geometry).length > 0;
@@ -2222,6 +2540,216 @@
     }
   }
 
+  function fmtKmPrecise(value) {
+    const km = Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+    return km.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' km';
+  }
+
+  function fmtMinutesCompact(value) {
+    const total = Number.isFinite(Number(value)) ? Math.max(0, Math.round(Number(value))) : 0;
+    if (total >= 60) {
+      const hours = Math.floor(total / 60);
+      const minutes = total % 60;
+      return minutes > 0 ? hours + ' h ' + minutes + ' min' : hours + ' h';
+    }
+    return total + ' min';
+  }
+
+  function formatWeekRangeLabel(weekStart, weekEnd) {
+    const parseYmd = function (raw) {
+      if (typeof raw !== 'string' || raw.length < 10) return null;
+      const parts = raw.split('-');
+      if (parts.length !== 3) return null;
+      const y = Number(parts[0]);
+      const m = Number(parts[1]);
+      const d = Number(parts[2]);
+      if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+      return new Date(y, m - 1, d);
+    };
+    const start = parseYmd(weekStart);
+    const end = parseYmd(weekEnd);
+    if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return 'Wochenstatistik';
+    }
+    const sameMonth = start.getMonth() === end.getMonth() && start.getFullYear() === end.getFullYear();
+    const startFmt = new Intl.DateTimeFormat('de-DE', {
+      day: '2-digit',
+      month: sameMonth ? undefined : '2-digit',
+      year: sameMonth ? undefined : 'numeric',
+    }).format(start);
+    const endFmt = new Intl.DateTimeFormat('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(end);
+    return startFmt + ' – ' + endFmt;
+  }
+
+  function shiftWeekStart(weekStart, deltaWeeks) {
+    if (typeof weekStart !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(weekStart)) {
+      return null;
+    }
+    const parts = weekStart.split('-');
+    const next = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    if (Number.isNaN(next.getTime())) {
+      return null;
+    }
+    next.setDate(next.getDate() + deltaWeeks * 7);
+    const y = next.getFullYear();
+    const m = String(next.getMonth() + 1).padStart(2, '0');
+    const d = String(next.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + d;
+  }
+
+  function buildLocationSummary(placeEl, streetEl, fallbackLabel) {
+    const place = placeEl ? String(placeEl.value || '').trim() : '';
+    const street = streetEl ? String(streetEl.value || '').trim() : '';
+    const text = [place, street].filter(Boolean).join(', ');
+    return text || fallbackLabel;
+  }
+
+  function buildRouteHistoryPayload(navDetail) {
+    const distanceKm =
+      navDetail && Number.isFinite(Number(navDetail.distance_km)) ? Math.max(0, Number(navDetail.distance_km)) : 0;
+    const durationMinutes =
+      navDetail && Number.isFinite(Number(navDetail.duration_minutes))
+        ? Math.max(0, Math.round(Number(navDetail.duration_minutes)))
+        : null;
+    const routeType =
+      state.lastRoute && typeof state.lastRoute.roundtrip_mode === 'string' && state.lastRoute.roundtrip_mode
+        ? state.lastRoute.roundtrip_mode
+        : 'route';
+    return {
+      distance_km: Math.round(distanceKm * 100) / 100,
+      duration_minutes: durationMinutes,
+      route_type: routeType,
+      start_location: buildLocationSummary(startPlaceEl, startStreetEl, routeType !== 'route' ? 'Rundkurs Start' : 'Start'),
+      end_location:
+        routeType !== 'route'
+          ? buildLocationSummary(startPlaceEl, startStreetEl, 'Rundkurs Ziel')
+          : buildLocationSummary(goalPlaceEl, goalStreetEl, 'Ziel'),
+    };
+  }
+
+  function updateAccountSummaryUi() {
+    const user = state.currentUser;
+    if (kontoStatsPanel) {
+      kontoStatsPanel.hidden = !user;
+    }
+    if (kontoTotalKilometers) {
+      kontoTotalKilometers.textContent = user ? fmtKmPrecise(user.total_kilometers) : '0,00 km';
+    }
+    if (kontoTotalRoutes) {
+      kontoTotalRoutes.textContent = user ? String(Math.max(0, Math.floor(Number(user.total_routes) || 0))) : '0';
+    }
+    if (kontoTotalNavTime) {
+      kontoTotalNavTime.textContent = user ? fmtMinutesCompact(user.total_navigation_time) : '0 min';
+    }
+  }
+
+  function renderRouteHistoryStats() {
+    const stats = state.routeHistoryStats;
+    const cols = kontoStatsChart ? Array.from(kontoStatsChart.querySelectorAll('.konto-chart-col')) : [];
+    if (kontoStatsWeekLabel) {
+      kontoStatsWeekLabel.textContent =
+        stats && stats.week_start && stats.week_end
+          ? formatWeekRangeLabel(stats.week_start, stats.week_end)
+          : 'Wochenstatistik';
+    }
+    if (kontoStatsWeekSubtitle) {
+      kontoStatsWeekSubtitle.textContent = stats ? 'Montag bis Sonntag' : 'Noch keine Fahrten gespeichert.';
+    }
+    if (!cols.length) {
+      return;
+    }
+    const days = stats && Array.isArray(stats.days) ? stats.days : [];
+    const maxValue = days.reduce(function (acc, day) {
+      const v = day && Number.isFinite(Number(day.distance_km)) ? Number(day.distance_km) : 0;
+      return Math.max(acc, v);
+    }, 0);
+    cols.forEach(function (col, index) {
+      const day = days[index] || null;
+      const value = day && Number.isFinite(Number(day.distance_km)) ? Math.max(0, Number(day.distance_km)) : 0;
+      const height = maxValue > 0 ? Math.max(4, Math.round((value / maxValue) * 100)) : 4;
+      const valueEl = col.querySelector('.konto-chart-value');
+      const barEl = col.querySelector('.konto-chart-bar');
+      if (valueEl) {
+        valueEl.textContent =
+          value > 0
+            ? value.toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' km'
+            : '0,0 km';
+      }
+      if (barEl) {
+        barEl.style.height = (value > 0 ? height : 4) + '%';
+        barEl.style.opacity = value > 0 ? '1' : '0.28';
+      }
+      if (day && day.date) {
+        col.setAttribute('title', day.date + ' · ' + (valueEl ? valueEl.textContent : '0,0 km'));
+      } else {
+        col.removeAttribute('title');
+      }
+    });
+  }
+
+  async function loadRouteHistoryStats(weekStart) {
+    if (!state.currentUser) {
+      state.routeHistoryWeekStart = null;
+      state.routeHistoryStats = null;
+      updateAccountSummaryUi();
+      renderRouteHistoryStats();
+      return;
+    }
+    state.routeHistoryLoading = true;
+    try {
+      const qs = weekStart ? '?week_start=' + encodeURIComponent(weekStart) : '';
+      const data = await fetchGetJson(apiUrl('api/navigation_history.php' + qs));
+      if (!data.ok || !data.stats) {
+        throw new Error(data.error || 'Statistik konnte nicht geladen werden.');
+      }
+      state.routeHistoryStats = data.stats;
+      state.routeHistoryWeekStart = data.stats.week_start || null;
+      renderRouteHistoryStats();
+    } catch (err) {
+      state.routeHistoryStats = null;
+      renderRouteHistoryStats();
+      if (kontoStatsWeekSubtitle) {
+        kontoStatsWeekSubtitle.textContent = err && err.message ? err.message : 'Statistik konnte nicht geladen werden.';
+      }
+    } finally {
+      state.routeHistoryLoading = false;
+    }
+  }
+
+  async function persistCompletedNavigation(navDetail) {
+    if (state.routeHistorySaveInFlight || !state.currentUser) {
+      return;
+    }
+    const payload = buildRouteHistoryPayload(navDetail);
+    if (!Number.isFinite(Number(payload.distance_km)) || Number(payload.distance_km) <= 0.01) {
+      return;
+    }
+    state.routeHistorySaveInFlight = true;
+    try {
+      const data = await fetchJson(apiUrl('api/navigation_history.php'), {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (!data.ok || !data.user) {
+        throw new Error(data.error || 'Fahrt konnte nicht gespeichert werden.');
+      }
+      state.currentUser = data.user;
+      if (data.stats) {
+        state.routeHistoryStats = data.stats;
+        state.routeHistoryWeekStart = data.stats.week_start || null;
+      }
+      updateAuthUi();
+      renderRouteHistoryStats();
+    } catch (err) {
+      if (routeInfo) {
+        routeInfo.textContent = 'Tourstatistik konnte nicht gespeichert werden: ' + (err.message || String(err));
+        routeInfo.hidden = false;
+      }
+    } finally {
+      state.routeHistorySaveInFlight = false;
+    }
+  }
+
   function buildSavedRouteTitleSuggestion(routeData) {
     const isRoundtrip = !!(routeData && routeData.roundtrip_mode);
     const startPlace = typeof startPlaceEl !== 'undefined' && startPlaceEl ? String(startPlaceEl.value || '').trim() : '';
@@ -2287,6 +2815,63 @@
     setHintMessage(authMessage, 'Konto angelegt. Bitte bestätigen Sie Ihre E-Mail-Adresse.');
   }
 
+  function isRoundtripRouteData(routeData) {
+    return !!(routeData && routeData.roundtrip_mode);
+  }
+
+  function buildStartPinHtml(showBadge) {
+    return (
+      (showBadge ? '<span class="route-pin-badge" aria-hidden="true">Start</span>' : '') +
+      '<span class="route-pin-dot" aria-hidden="true"></span>'
+    );
+  }
+
+  function buildGoalPinHtml(showBadge) {
+    return (
+      (showBadge ? '<span class="route-pin-badge" aria-hidden="true">Ende</span>' : '') +
+      '<span class="route-pin-dot" aria-hidden="true"></span>'
+    );
+  }
+
+  function buildStartIcon(showBadge) {
+    return L.divIcon({
+      className: 'route-pin route-pin-start',
+      iconSize: [52, 42],
+      iconAnchor: [11, 11],
+      html: buildStartPinHtml(showBadge),
+    });
+  }
+
+  function buildGoalIcon(showBadge) {
+    return L.divIcon({
+      className: 'route-pin route-pin-goal',
+      iconSize: [52, 42],
+      iconAnchor: [11, 11],
+      html: buildGoalPinHtml(showBadge),
+    });
+  }
+
+  function syncEndpointMarkerPresentation(routeData) {
+    const isRoundtrip = isRoundtripRouteData(routeData);
+    if (startMarker && typeof startMarker.setIcon === 'function') {
+      startMarker.setIcon(buildStartIcon(!isRoundtrip));
+    }
+    if (isRoundtrip) {
+      if (goalMarker) {
+        try {
+          map.removeLayer(goalMarker);
+        } catch (e0) {
+          /* ignore */
+        }
+        goalMarker = null;
+      }
+      return;
+    }
+    if (goalMarker && typeof goalMarker.setIcon === 'function') {
+      goalMarker.setIcon(buildGoalIcon(true));
+    }
+  }
+
   function routeKindFromRouteData(data) {
     return data && data.roundtrip_mode ? 'roundtrip' : 'point_to_point';
   }
@@ -2333,9 +2918,10 @@
     if (Array.isArray(a) && a.length >= 2) {
       setStart(L.latLng(a[0], a[1]));
     }
-    if (Array.isArray(b) && b.length >= 2) {
+    if (!isRoundtripRouteData(routeData) && Array.isArray(b) && b.length >= 2) {
       setGoal(L.latLng(b[0], b[1]));
     }
+    syncEndpointMarkerPresentation(routeData);
   }
 
   function nrTopBarUserLabel(user) {
@@ -2384,6 +2970,7 @@
       const points = user && Number.isFinite(Number(user.fitness_points)) ? Number(user.fitness_points) : 0;
       panelFitnessPoints.textContent = String(Math.max(0, Math.floor(points)));
     }
+    updateAccountSummaryUi();
     if (topBarUserMeta) {
       if (user) {
         topBarUserMeta.removeAttribute('hidden');
@@ -2466,6 +3053,9 @@
       savedRoutesList.innerHTML = '';
     }
     if (!user) {
+      state.routeHistoryWeekStart = null;
+      state.routeHistoryStats = null;
+      renderRouteHistoryStats();
       setHintMessage(savedRoutesMessage, 'Zum Speichern und Laden bitte anmelden.');
     }
   }
@@ -2664,6 +3254,10 @@
     closeSavedRouteRenameDialog();
     closeNavFeedbackDialog();
     setHintMessage(savedRoutesMessage, '');
+    state.routeHistoryWeekStart = null;
+    state.routeHistoryStats = null;
+    state.routeHistorySaveInFlight = false;
+    renderRouteHistoryStats();
   }
 
   function clearAuthFields(options) {
@@ -3130,8 +3724,10 @@
     const parts = [];
     parts.push(state.start ? 'Start gesetzt' : 'Start fehlt');
     parts.push(state.goal ? 'Ziel gesetzt' : 'Ziel fehlt');
-    if (state.vias.length) {
-      parts.push(state.vias.length + ' Zwischenpunkt(e)');
+    const pointToPointViaCount =
+      getRtMode() === 'waypoints' && state.goal ? state.rtWaypoints.length : state.vias.length;
+    if (pointToPointViaCount) {
+      parts.push(pointToPointViaCount + ' Zwischenpunkt(e)');
     }
     const hints = [];
     if (state.noExitHighlightActive) {
@@ -3143,8 +3739,9 @@
     }
     let tail = ' · Karte: Klick setzt Punkte, Umschalt + Klick fügt Zwischenpunkte hinzu';
     if (getRtMode() === 'waypoints') {
-      tail =
-        ' · Rundkurs Wegpunkte: Erster Klick = Start (Beginn & Ende), danach Zwischenpunkte (max. 9). Mindestens Start + 2 weitere Punkte, dann „Rundkurs aus Wegpunkten berechnen“. Nach der Berechnung Start und Wegpunkte ziehen und „Neu berechnen“. Escape oder „Letzten Wegpunkt entfernen“ für den letzten Zwischenpunkt.';
+      tail = state.goal
+        ? ' · Wegpunkt-Modus aktiv: Die sichtbaren Wegpunkte werden auch bei „Route berechnen“ als Zwischenpunkte zwischen Start und Ziel verwendet.'
+        : ' · Rundkurs Wegpunkte: Erster Klick = Start (Beginn & Ende), danach Zwischenpunkte (max. 9). Mindestens Start + 2 weitere Punkte, dann „Rundkurs aus Wegpunkten berechnen“. Nach der Berechnung Start und Wegpunkte ziehen und „Neu berechnen“. Escape oder „Letzten Wegpunkt entfernen“ für den letzten Zwischenpunkt.';
     }
     if (hints.length) {
       tail = ' · ' + hints.join(' — ') + tail;
@@ -3263,14 +3860,23 @@
         ' · ' +
         fmtMin(v.duration) +
         (v.dead_end_segments_removed ? ' · bereinigt: ' + v.dead_end_segments_removed : '');
+      const actions = document.createElement('div');
+      actions.className = 'rt-card-actions';
       const pick = document.createElement('button');
       pick.type = 'button';
       pick.className = 'btn btn-secondary rt-pick';
       pick.setAttribute('data-idx', String(idx));
       pick.textContent = 'Auf Karte anzeigen';
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'btn btn-secondary rt-save';
+      save.setAttribute('data-idx', String(idx));
+      save.textContent = 'Speichern';
+      actions.appendChild(pick);
+      actions.appendChild(save);
       card.appendChild(head);
       card.appendChild(meta);
-      card.appendChild(pick);
+      card.appendChild(actions);
       box.appendChild(card);
     });
 
@@ -3318,6 +3924,59 @@
           resetRouteBusyBar();
           if (routeBusyDetail) {
             routeBusyDetail.textContent = '';
+          }
+        }
+      });
+    });
+
+    box.querySelectorAll('.rt-save').forEach(function (btnSave) {
+      btnSave.addEventListener('click', async function () {
+        const idx = parseInt(btnSave.getAttribute('data-idx') || '-1', 10);
+        const v = state.roundtripVariants && state.roundtripVariants[idx];
+        if (!v) {
+          return;
+        }
+        routeError.hidden = true;
+        clearRouteLayer();
+        state.lastRoute = null;
+        if (state.noExitHighlightActive) {
+          clearNoExitHighlightLayer();
+        }
+        refreshRouteButton();
+        setRouteBusyVisible(true);
+        updateRouteBusyProgress({
+          title: 'Variante wird gespeichert',
+          detail: 'Ausgewählte Variante wird auf die Karte gelegt.',
+          indeterminate: true,
+          stage: 'map',
+        });
+        try {
+          if (state.noExitHighlightActive) {
+            setNoExitHighlightMode(false);
+          }
+          await finalizeRouteOnMap(v);
+        } catch (e) {
+          routeError.textContent = e.message || String(e);
+          routeError.hidden = false;
+          setRouteBusyVisible(false);
+          resetRouteBusyBar();
+          if (routeBusyDetail) {
+            routeBusyDetail.textContent = '';
+          }
+          return;
+        }
+        setRouteBusyVisible(false);
+        resetRouteBusyBar();
+        if (routeBusyDetail) {
+          routeBusyDetail.textContent = '';
+        }
+        // Statt sofort zu speichern: Tour-Verwaltung öffnen, damit Titel/Variante bewusst gespeichert werden kann.
+        if (typeof openSavedRoutesManageDialog === 'function') {
+          openSavedRoutesManageDialog();
+        } else {
+          const btnSavedRoutesManage = document.getElementById('btn-saved-routes-manage');
+          if (btnSavedRoutesManage) {
+            btnSavedRoutesManage.click();
           }
         }
       });
@@ -3883,6 +4542,9 @@
       kontoDialog.hidden = false;
       kontoDialog.setAttribute('aria-hidden', 'false');
       document.body.classList.add('konto-dialog-open');
+      if (state.currentUser) {
+        void loadRouteHistoryStats(state.routeHistoryWeekStart);
+      }
       window.setTimeout(function () {
         const u = state.currentUser;
         if (!u && authEmail) {
@@ -3952,6 +4614,26 @@
     }
     return { show: show, hide: hide, showFocusOrs: showFocusOrs };
   })();
+
+  if (kontoStatsPrevWeek) {
+    kontoStatsPrevWeek.addEventListener('click', function () {
+      const nextWeek = shiftWeekStart(state.routeHistoryWeekStart, -1);
+      if (!nextWeek) {
+        return;
+      }
+      void loadRouteHistoryStats(nextWeek);
+    });
+  }
+
+  if (kontoStatsNextWeek) {
+    kontoStatsNextWeek.addEventListener('click', function () {
+      const nextWeek = shiftWeekStart(state.routeHistoryWeekStart, 1);
+      if (!nextWeek) {
+        return;
+      }
+      void loadRouteHistoryStats(nextWeek);
+    });
+  }
 
   const NRAddressbookDialog = (function () {
     let outsideBound = false;
@@ -4543,12 +5225,7 @@
   function setStart(latlng) {
     state.start = latlng;
     if (startMarker) map.removeLayer(startMarker);
-    const startIcon = L.divIcon({
-      className: 'route-pin route-pin-start',
-      iconSize: [22, 22],
-      iconAnchor: [11, 11],
-      html: '<span class="route-pin-dot" aria-hidden="true"></span>',
-    });
+    const startIcon = buildStartIcon(!isRoundtripRouteData(state.lastRoute));
     startMarker = L.marker(latlng, {
       icon: startIcon,
       draggable: true,
@@ -4607,12 +5284,7 @@
   function setGoal(latlng) {
     state.goal = latlng;
     if (goalMarker) map.removeLayer(goalMarker);
-    const goalIcon = L.divIcon({
-      className: 'route-pin route-pin-goal',
-      iconSize: [22, 22],
-      iconAnchor: [11, 11],
-      html: '<span class="route-pin-dot" aria-hidden="true"></span>',
-    });
+    const goalIcon = buildGoalIcon(!isRoundtripRouteData(state.lastRoute));
     goalMarker = L.marker(latlng, { icon: goalIcon, draggable: true, title: 'Ziel' }).addTo(map);
     goalMarker.on('dragend', function (e) {
       state.goal = e.target.getLatLng();
@@ -4625,16 +5297,55 @@
     }
   }
 
+  function buildViaMarkerIcon(number) {
+    return L.divIcon({
+      className: 'route-via-marker-icon',
+      html: '<div class="route-via-marker"><span>' + number + '</span></div>',
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+    });
+  }
+
+  function relabelViaMarkers() {
+    viaMarkers.forEach(function (marker, i) {
+      marker.setIcon(buildViaMarkerIcon(i + 1));
+      marker.options.title = 'Zwischenstopp ' + (i + 1);
+    });
+  }
+
+  function notifyRouteOutdatedAfterViaChange() {
+    if (!state.lastRoute || !routeInfo) {
+      return;
+    }
+    routeInfo.textContent =
+      'Wegpunkte wurden geändert — auf „Route berechnen" tippen, damit die Strecke alle Wegpunkte einschließt.';
+    routeInfo.hidden = false;
+  }
+
+  function currentPointToPointViaLatLngs() {
+    if (getRtMode() === 'waypoints' && state.rtWaypoints.length) {
+      return state.rtWaypoints.slice();
+    }
+    return state.vias.slice();
+  }
+
   function addVia(latlng) {
     if (state.vias.length >= 8) return;
     state.vias.push(latlng);
-    const m = L.marker(latlng, { draggable: true, title: 'Zwischenstopp' }).addTo(map);
     const idx = state.vias.length - 1;
+    const m = L.marker(latlng, {
+      draggable: true,
+      title: 'Zwischenstopp ' + (idx + 1),
+      icon: buildViaMarkerIcon(idx + 1),
+      zIndexOffset: 950,
+    }).addTo(map);
     m.on('dragend', function (e) {
       state.vias[idx] = e.target.getLatLng();
+      notifyRouteOutdatedAfterViaChange();
     });
     viaMarkers.push(m);
     updatePointStatus();
+    notifyRouteOutdatedAfterViaChange();
   }
 
   map.on('click', function (e) {
@@ -4651,13 +5362,15 @@
     } else if (!state.goal) {
       setGoal(e.latlng);
     } else {
-      setGoal(e.latlng);
+      // Start + Ziel sind gesetzt — weitere Klicks werden zu Wegpunkten zwischen Start und Ziel.
+      // Ziel selbst lässt sich per Drag des Ziel-Markers verschieben.
+      addVia(e.latlng);
     }
   });
 
   map.on('moveend', scheduleNoExitHighlightRefresh);
 
-  const NR_PROFILE_ALLOWED = new Set(['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege', 'abenteuer']);
+  const NR_PROFILE_ALLOWED = new Set(['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege']);
   const NR_PROFILE_STORAGE_KEY = 'nr_last_profile_local';
   let activeProfile = 'natur';
 
@@ -4697,10 +5410,9 @@
       natur: 'Naturroute',
       gravel: 'Schotterroute',
       offroad: 'Feld-/Waldwege',
-      kurvig: 'Kurvenreich',
+      kurvig: 'Tourenrad',
       ruhig: 'Ruhige Route',
       radwege: 'Nur Radwege',
-      abenteuer: 'Abenteuerroute',
     };
 
     function labelFor(v) {
@@ -5017,6 +5729,7 @@
         updateAuthUi();
         NRKontoDialog.hide();
         await loadUserSettings();
+        await loadRouteHistoryStats(null);
         await loadSavedRoutes();
         refreshRouteButton();
         ensureTtsAfterLogin();
@@ -5292,7 +6005,8 @@
       }
     });
   }
-  document.addEventListener('nr-nav-ended', function () {
+  document.addEventListener('nr-nav-ended', function (ev) {
+    void persistCompletedNavigation(ev && ev.detail ? ev.detail : null);
     openNavFeedbackDialog();
   });
   document.addEventListener('keydown', function (ev) {
@@ -5566,14 +6280,16 @@
       'Teilstücke werden verbunden, Abzweige und Rückwege werden geprüft.',
       'Sackgassen-Detektor läuft: rote Kandidaten werden herausgefiltert.',
       'Varianten werden bewertet, sortiert und für die Karte vorbereitet.',
+      'POI-Suche wird vorbereitet: Sehenswürdigkeiten, Naturorte und Gegenden entlang der Strecke werden gesammelt.',
     ];
-    const stages = ['route', 'roundtrip', 'roundtrip', 'clean', 'map'];
-    const delays = [0, 2000, 5200, 9000, 13500];
+    const stages = ['route', 'roundtrip', 'roundtrip', 'clean', 'map', 'map'];
+    const delays = [0, 2000, 5200, 9000, 13500, 16200];
     const rotateHints = [
       'Berechnung läuft weiter: das Wegenetz wird noch nach fahrbaren Verbindungen durchsucht.',
       'Varianten werden gegeneinander geprüft: Distanz, Wegtyp und Schleifenqualität.',
       'Sackgassen und doppelte Rückwege werden automatisch bereinigt.',
       'Kartendaten werden vorbereitet, damit Route und Varianten sofort sichtbar sind.',
+      'Wikipedia-POIs entlang der Strecke werden gesucht und für die Navigation aufbereitet.',
       'Fast fertig: letzte Plausibilitätschecks und Darstellung.',
       'Bei großen Rundkursen kann dieser Schritt länger dauern, die App arbeitet weiter.',
     ];
@@ -5942,6 +6658,7 @@
       return L.latLng(p[0], p[1]);
     });
     attachRoutePolylineFromLatLngs(latlngs);
+    syncEndpointMarkerPresentation(data);
     map.fitBounds(routeLine.getBounds(), { padding: [24, 24] });
 
     document.getElementById('stat-dist').textContent = fmtKm(data.distance);
@@ -5973,6 +6690,7 @@
     }
   }
 
+
   document.getElementById('btn-route').addEventListener('click', async function () {
     const btnRoute = document.getElementById('btn-route');
     routeError.hidden = true;
@@ -5996,8 +6714,9 @@
     if (md > 0) {
       body.max_detour_km = md;
     }
-    if (state.vias.length) {
-      body.via = state.vias.map(function (v) {
+    const activeVias = currentPointToPointViaLatLngs();
+    if (activeVias.length) {
+      body.via = activeVias.map(function (v) {
         return [v.lat, v.lng];
       });
     }
@@ -6269,22 +6988,36 @@
         throw new Error(res.error || 'Rundkurs fehlgeschlagen');
       }
       const rawVariants = Array.isArray(res.variants) ? res.variants : [];
-      const cleanedVariants = [];
-      for (let idx = 0; idx < rawVariants.length; idx++) {
+      let completedCleanups = 0;
+      const cleanedVariants = await mapWithConcurrency(rawVariants, 2, async function (variant, idx, list) {
         updateRouteBusyProgress({
           title: 'Rundkurse werden bereinigt',
           detail:
             'Variante ' +
             (idx + 1) +
             ' von ' +
-            Math.max(1, rawVariants.length) +
+            Math.max(1, list.length) +
             ': Sackgassen-Check läuft.',
           indeterminate: false,
-          progress: 56 + Math.round((idx / Math.max(1, rawVariants.length)) * 24),
+          progress: 56 + Math.round((completedCleanups / Math.max(1, list.length)) * 24),
           stage: 'clean',
         });
-        cleanedVariants.push(await cleanRoundtripVariant(rawVariants[idx]));
-      }
+        const passes = idx === 0 ? ROUNDTRIP_DEAD_END_REROUTE_PASSES : ROUNDTRIP_DEAD_END_REROUTE_PASSES_FOLLOWUP;
+        const cleaned = await cleanRoundtripVariant(variant, passes);
+        completedCleanups++;
+        updateRouteBusyProgress({
+          title: 'Rundkurse werden bereinigt',
+          detail:
+            Math.min(completedCleanups, Math.max(1, list.length)) +
+            ' von ' +
+            Math.max(1, list.length) +
+            ' Varianten bereinigt.',
+          indeterminate: false,
+          progress: 56 + Math.round((completedCleanups / Math.max(1, list.length)) * 24),
+          stage: 'clean',
+        });
+        return cleaned;
+      });
       state.roundtripVariants = cleanedVariants;
       const box = document.getElementById('rt-variants');
       if (!box) {
@@ -6411,6 +7144,7 @@
             variants: 1,
             profil: profil,
             rot_offset_deg: rotOffset,
+            fast_variant: true,
           }),
         }).finally(function () {
           window.clearTimeout(timeoutId);
@@ -6429,8 +7163,9 @@
           indeterminate: true,
           stage: 'clean',
         });
-        // Neue Variante: schneller fertig werden → weniger Cleaning-Pässe.
-        const cleaned = await cleanRoundtripVariant(rawVariants[0], 2);
+        // Neue Variante: schneller fertig werden → 1 Reroute-Pass mit weniger Wegpunkten.
+        // Phase 2 (Cut-Only) räumt verbleibende Sackgassen ohne weitere ORS-Calls auf.
+        const cleaned = await cleanRoundtripVariant(rawVariants[0], 1, { rerouteWaypoints: 5 });
         state.roundtripVariants = (Array.isArray(state.roundtripVariants) ? state.roundtripVariants : []).concat([cleaned]);
         renderRoundtripVariantsBox();
 
@@ -6465,6 +7200,9 @@
         btnRoundtripNewVariant.disabled = false;
         setRouteBusyVisible(false);
         resetRouteBusyBar();
+        if (routeBusyDetail) {
+          routeBusyDetail.textContent = '';
+        }
         if (routeBusyDetail) {
           routeBusyDetail.textContent = '';
         }
@@ -7365,6 +8103,7 @@
     }
   })();
 
+
   function schedulePiperGreetingOnPageLoad() {
     function debugLog() {}
 
@@ -7746,6 +8485,145 @@
     );
   })();
 
+  (function bindPiperPrewarmModal() {
+    const dialog = document.getElementById('piper-prewarm-dialog');
+    const fill = document.getElementById('piper-prewarm-progress-fill');
+    const sub = document.getElementById('piper-prewarm-sub');
+    const btnHide = document.getElementById('piper-prewarm-hide');
+    const btnSystem = document.getElementById('piper-prewarm-system');
+    if (!dialog || !fill) {
+      return;
+    }
+
+    function engineIsPiper() {
+      try {
+        const e = localStorage.getItem('nr_tts_engine');
+        return e !== 'system';
+      } catch (e0) {
+        return true;
+      }
+    }
+
+    function show() {
+      if (!engineIsPiper()) return;
+      dialog.hidden = false;
+      dialog.setAttribute('aria-hidden', 'false');
+    }
+
+    function hide() {
+      dialog.hidden = true;
+      dialog.setAttribute('aria-hidden', 'true');
+      fill.style.width = '0%';
+      const bar = dialog.querySelector('.piper-prewarm-progress');
+      if (bar) {
+        bar.setAttribute('aria-valuenow', '0');
+      }
+      if (sub) {
+        sub.textContent = '';
+        sub.hidden = true;
+      }
+    }
+
+    function setPct(pct) {
+      const v = Math.max(0, Math.min(100, Math.round(pct)));
+      fill.style.width = v + '%';
+      const bar = dialog.querySelector('.piper-prewarm-progress');
+      if (bar) {
+        bar.setAttribute('aria-valuenow', String(v));
+      }
+    }
+
+    function setSub(text) {
+      if (!sub) return;
+      sub.textContent = text || '';
+      sub.hidden = !text;
+    }
+
+    if (btnHide) {
+      btnHide.addEventListener('click', function () {
+        hide();
+      });
+    }
+    if (btnSystem) {
+      btnSystem.addEventListener('click', function () {
+        try {
+          localStorage.setItem('nr_tts_engine', 'system');
+        } catch (e) {
+          /* ignore */
+        }
+        try {
+          const btnP = document.getElementById('tts-engine-global-piper');
+          const btnS = document.getElementById('tts-engine-global-system');
+          if (btnP) btnP.classList.remove('is-active');
+          if (btnS) btnS.classList.add('is-active');
+        } catch (e2) {
+          /* ignore */
+        }
+        hide();
+      });
+    }
+    dialog.addEventListener('click', function (ev) {
+      if (ev.target === dialog) hide();
+    });
+    dialog.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') hide();
+    });
+
+    window.addEventListener(
+      'nr-piper-prewarm',
+      function (ev) {
+        const d = ev && ev.detail && typeof ev.detail === 'object' ? ev.detail : {};
+        const st = d.state ? String(d.state) : '';
+        if (!engineIsPiper() && (st === 'start' || st === 'progress')) {
+          return;
+        }
+        if (st === 'start') {
+          show();
+          setPct(4);
+          setSub('Modell wird geladen…');
+          return;
+        }
+        if (st === 'progress') {
+          show();
+          const p = d.progress && typeof d.progress === 'object' ? d.progress : null;
+          const total = p && Number.isFinite(Number(p.total)) ? Number(p.total) : 0;
+          const loaded = p && Number.isFinite(Number(p.loaded)) ? Number(p.loaded) : 0;
+          if (total > 0 && loaded >= 0) {
+            setPct(Math.max(6, Math.min(96, (loaded / total) * 100)));
+            setSub(
+              'Download: ' +
+                Math.round(loaded / (1024 * 1024)) +
+                ' / ' +
+                Math.round(total / (1024 * 1024)) +
+                ' MB'
+            );
+          } else {
+            const cur = parseFloat(fill.style.width || '0') || 0;
+            setPct(Math.min(92, Math.max(cur, 10) + 5));
+            setSub('Initialisierung läuft…');
+          }
+          return;
+        }
+        if (st === 'ready') {
+          setPct(100);
+          setSub('Piper ist bereit.');
+          window.setTimeout(hide, 450);
+          return;
+        }
+        if (st === 'failed' || st === 'error') {
+          setSub('Piper konnte nicht vorbereitet werden. Du kannst auf System‑Stimme wechseln.');
+          setPct(0);
+          show();
+          return;
+        }
+        if (st === 'cancelled') {
+          hide();
+        }
+      },
+      false
+    );
+  })();
+
   setAuthRegisterMode(false);
   updateAuthUi();
   showInitialAuthNotice();
@@ -7800,6 +8678,7 @@
         updateAuthUi();
         dismiss();
         await loadUserSettings();
+        await loadRouteHistoryStats(null);
         await loadSavedRoutes();
         refreshRouteButton();
         ensureTtsAfterLogin();
@@ -8084,6 +8963,8 @@
   })();
 
   // Begrüßung/Prewarm erst NACH Engine-Auswahl starten.
+  updateAccountSummaryUi();
+  renderRouteHistoryStats();
   updatePointStatus();
   refreshRouteButton();
 })();

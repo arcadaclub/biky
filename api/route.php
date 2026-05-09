@@ -53,6 +53,7 @@ try {
     $profil = nr_normalize_profil($input['profil'] ?? 'natur');
     $maxDetourKm = $isLoopFromWaypoints ? null : nr_normalize_max_detour_km($input['max_detour_km'] ?? null);
     $loopWaypointExtras = nr_loop_waypoint_response_extras($input);
+    $avoidPolygons = nr_normalize_avoid_polygons($input['avoid_polygons'] ?? null);
 } catch (Throwable $e) {
     nr_json_response(['ok' => false, 'error' => $e->getMessage()], 400);
     exit;
@@ -70,6 +71,7 @@ $apiKey = $sessionApiKey !== ''
 $baseUrl = is_array($orsCfg) ? (string) ($orsCfg['base_url'] ?? 'https://api.openrouteservice.org') : 'https://api.openrouteservice.org';
 
 $cachePayload = [
+    'route_version' => 6,
     'user_id' => (int) $user['id'],
     'ors_key_hash' => hash('sha256', $apiKey),
     'base_url' => $baseUrl,
@@ -79,7 +81,10 @@ $cachePayload = [
 if ($maxDetourKm !== null) {
     $cachePayload['max_detour_km'] = $maxDetourKm;
 }
-$cacheKey = 'route_ors_user_v1_' . hash('sha256', json_encode($cachePayload, JSON_THROW_ON_ERROR));
+if ($avoidPolygons !== null) {
+    $cachePayload['avoid'] = substr(hash('sha256', json_encode($avoidPolygons, JSON_UNESCAPED_UNICODE)), 0, 12);
+}
+$cacheKey = 'route_ors_user_v4_' . hash('sha256', json_encode($cachePayload, JSON_THROW_ON_ERROR));
 $cacheFile = dirname(__DIR__) . '/cache/' . $cacheKey . '.json';
 $ttl = 21600;
 
@@ -99,9 +104,12 @@ try {
     $ors = new OpenRouteService($baseUrl, $apiKey);
     if ($isLoopFromWaypoints) {
         // Wegpunkte-Rundkurs: alle Wegpunkte in Reihenfolge verbinden (Segment-Routing).
-        $orsMeta = $ors->routeWaypointsLoopWithMeta($points, $profil);
+        $orsMeta = $ors->routeWaypointsLoopWithMeta($points, $profil, $avoidPolygons);
+    } elseif (count($points) > 2) {
+        // Normale Route mit Zwischenpunkten: segmentweise routen, damit jeder Wegpunkt sicher getroffen wird.
+        $orsMeta = $ors->routeWaypointsPathWithMeta($points, $profil, $maxDetourKm, $avoidPolygons);
     } else {
-        $orsMeta = $ors->routeWithMeta($points, $profil, $maxDetourKm, false);
+        $orsMeta = $ors->routeWithMeta($points, $profil, $maxDetourKm, false, $avoidPolygons);
     }
     $geojson = $orsMeta['geojson'];
     $detourCapped = (bool) ($orsMeta['detour_capped'] ?? false);
@@ -237,7 +245,7 @@ function nr_pair(mixed $lat, mixed $lon): array
 function nr_normalize_profil(mixed $p): string
 {
     $s = is_string($p) ? strtolower(trim($p)) : 'natur';
-    $allowed = ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'abenteuer', 'radwege'];
+    $allowed = ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege'];
     if (!in_array($s, $allowed, true)) {
         return 'natur';
     }
@@ -260,4 +268,62 @@ function nr_normalize_max_detour_km(mixed $v): ?float
     }
 
     return round(min(150.0, max(0.05, $f)), 2);
+}
+
+/**
+ * Avoid-Polygone aus Client-Request annehmen — entweder als GeoJSON-Geometry (Polygon/MultiPolygon)
+ * oder als Liste von Lat-Lon-Polylinien, die zu Bounding-Box-Polygonen gepuffert werden.
+ *
+ * @return array<string, mixed>|null GeoJSON-Geometry oder null
+ */
+function nr_normalize_avoid_polygons(mixed $v): ?array
+{
+    if (!is_array($v) || $v === []) {
+        return null;
+    }
+
+    if (isset($v['type'], $v['coordinates']) && in_array($v['type'], ['Polygon', 'MultiPolygon'], true) && is_array($v['coordinates']) && $v['coordinates'] !== []) {
+        return [
+            'type' => (string) $v['type'],
+            'coordinates' => $v['coordinates'],
+        ];
+    }
+
+    // Lat/Lon-Polylinien aus Client → Bounding-Box-Polygone (gleiche Logik wie dead_end_polygons.php)
+    if (isset($v['ways']) && is_array($v['ways'])) {
+        require_once dirname(__DIR__) . '/includes/dead_end_polygons.php';
+        $ways = [];
+        foreach ($v['ways'] as $wayRaw) {
+            if (!is_array($wayRaw)) {
+                continue;
+            }
+            $coords = isset($wayRaw['coordinates']) && is_array($wayRaw['coordinates']) ? $wayRaw['coordinates'] : $wayRaw;
+            $line = [];
+            foreach ($coords as $pt) {
+                if (!is_array($pt) || count($pt) < 2) {
+                    continue;
+                }
+                $plat = (float) $pt[0];
+                $plon = (float) $pt[1];
+                if (!is_finite($plat) || !is_finite($plon)) {
+                    continue;
+                }
+                $line[] = [$plat, $plon];
+            }
+            if (count($line) >= 2) {
+                $ways[] = $line;
+            }
+        }
+        if ($ways === []) {
+            return null;
+        }
+        $polygons = nr_dead_end_polygons_from_ways($ways, NR_DEAD_END_AVOID_BUFFER_M);
+        if ($polygons === []) {
+            return null;
+        }
+
+        return ['type' => 'MultiPolygon', 'coordinates' => $polygons];
+    }
+
+    return null;
 }

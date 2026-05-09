@@ -1,6 +1,6 @@
 {
   "name": "biketour",
-  "version": "2.5.0",
+  "version": "2.7.0",
   "description": "Webbasierte Fahrrad-Navigation mit OpenStreetMap, Leaflet und OpenRouteService (Routing über PHP-Backend), inklusive Natur-/Asphalt-Anteilen, GPX-Export, Höhenprofil und responsiver UI.",
   "main": "index.js",
   "scripts": {

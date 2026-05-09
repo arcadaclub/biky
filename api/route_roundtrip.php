@@ -6,6 +6,7 @@ require dirname(__DIR__) . '/includes/bootstrap.php';
 require dirname(__DIR__) . '/includes/OpenRouteService.php';
 require dirname(__DIR__) . '/includes/route_geojson.php';
 require dirname(__DIR__) . '/includes/geo_wgs84.php';
+require dirname(__DIR__) . '/includes/dead_end_polygons.php';
 require dirname(__DIR__) . '/includes/auth_db.php';
 
 nr_session_start();
@@ -71,6 +72,7 @@ try {
     }
 
     $profil = nr_rt_normalize_profil($input['profil'] ?? 'natur');
+    $fastVariant = !empty($input['fast_variant']);
 
     $rotationOffsetDeg = 0.0;
     if (array_key_exists('rot_offset_deg', $input)) {
@@ -129,6 +131,16 @@ try {
     exit;
 }
 
+/*
+ * Sackgassen-Avoid-Polygone vorab holen — einmal pro Anfrage, wird über alle Varianten geteilt.
+ * Wenn Overpass nicht erreichbar oder der Bereich zu groß ist, läuft die Pipeline ohne Avoid weiter
+ * (die nachgelagerte Spike-Erkennung fängt das ab — siehe cleanRoundtripVariant im Client).
+ */
+$avoidPolygons = nr_dead_end_polygons_for_circle($lat, $lon, $radiusM);
+$avoidFingerprint = $avoidPolygons === null
+    ? 'none'
+    : substr(hash('sha256', json_encode($avoidPolygons, JSON_UNESCAPED_UNICODE)), 0, 12);
+
 // Viele ORS-Calls + Wartezeiten bei 429: Standard-Timeout (z. B. 30 s) sonst zu knapp.
 if (function_exists('set_time_limit')) {
     @set_time_limit(180);
@@ -147,7 +159,7 @@ for ($i = 1; $i <= $variants; $i++) {
      * den Cache, auch wenn der User die Variantenzahl ändert.
      */
     $cachePayload = [
-        'mode' => 'circle_loop_v24',
+        'mode' => $fastVariant ? 'circle_loop_fast_v5' : 'circle_loop_v29',
         'user_id' => (int) $user['id'],
         'ors_key_hash' => hash('sha256', $apiKey),
         'base_url' => $baseUrl,
@@ -156,8 +168,10 @@ for ($i = 1; $i <= $variants; $i++) {
         'd' => round($targetDistanceKm, 4),
         'r' => round($radiusKm, 4),
         'p' => $profil,
+        'fast' => $fastVariant ? 1 : 0,
         'n' => $nLoop,
         'rot' => round($rotationDeg, 4),
+        'avoid' => $avoidFingerprint,
     ];
     $cacheKey = 'route_rt_' . hash('sha256', json_encode($cachePayload, JSON_THROW_ON_ERROR));
     $cacheFile = dirname(__DIR__) . '/cache/' . $cacheKey . '.json';
@@ -189,7 +203,9 @@ for ($i = 1; $i <= $variants; $i++) {
             $nLoop,
             $profil,
             $targetDistanceKm,
-            $i
+            $i,
+            $avoidPolygons,
+            $fastVariant
         );
         $outVariants[] = $one;
         $encodedOne = json_encode($one, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
@@ -224,6 +240,10 @@ $response = [
     'roundtrip_batched' => ($nLoop + 1) > 50,
     // Luftlinie des internen Referenzkreises; sollte der gewünschten Rundkurslänge entsprechen.
     'geodesic_loop_km' => round($targetDistanceKm, 1),
+    'dead_end_avoid_active' => $avoidPolygons !== null,
+    'dead_end_avoid_polygon_count' => $avoidPolygons !== null && isset($avoidPolygons['coordinates']) && is_array($avoidPolygons['coordinates'])
+        ? count($avoidPolygons['coordinates'])
+        : 0,
 ];
 if ($errors !== []) {
     $response['partial_errors'] = $errors;
@@ -239,7 +259,7 @@ echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
 function nr_rt_normalize_profil(mixed $p): string
 {
     $s = is_string($p) ? strtolower(trim($p)) : 'natur';
-    $allowed = ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'abenteuer', 'radwege'];
+    $allowed = ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege'];
 
     return in_array($s, $allowed, true) ? $s : 'natur';
 }
@@ -258,9 +278,14 @@ function nr_rt_build_variant_route(
     int $nLoop,
     string $profil,
     float $targetDistanceKm,
-    int $variantIndex
+    int $variantIndex,
+    ?array $avoidPolygons = null,
+    bool $fastVariant = false
 ): array {
     $plan = nr_rt_profile_plan($profil);
+    if ($fastVariant) {
+        $plan = nr_rt_fast_profile_plan($plan);
+    }
 
     /**
      * Erst die "billige" Phase routen und sofort prüfen, ob sie die strict-Qualität schon erreicht
@@ -276,7 +301,8 @@ function nr_rt_build_variant_route(
         $profil,
         $targetDistanceKm,
         $variantIndex,
-        $plan['primary_phase_offsets']
+        $plan['primary_phase_offsets'],
+        $avoidPolygons
     );
 
     $earlyStrict = array_values(array_filter(
@@ -292,8 +318,28 @@ function nr_rt_build_variant_route(
     }
 
     $candidateRoutes = $primaryRoutes;
-    $bestPrimary = nr_rt_pick_best_candidate($primaryRoutes, $targetDistanceKm, $profil);
-    $adaptiveRadiusM = nr_rt_adaptive_radius_m($bestPrimary, $radiusM, $targetDistanceKm);
+    if ($fastVariant) {
+        foreach (['relaxed', 'fallback', 'last_resort'] as $level) {
+            $matching = array_values(array_filter(
+                $candidateRoutes,
+                static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, $level)
+            ));
+            if ($matching !== []) {
+                return nr_rt_attach_quality_meta(
+                    nr_rt_pick_best_candidate($matching, $targetDistanceKm, $profil),
+                    'fast_' . $level,
+                    $targetDistanceKm
+                );
+            }
+        }
+    }
+
+    $bestPrimary = $primaryRoutes !== []
+        ? nr_rt_pick_best_candidate($primaryRoutes, $targetDistanceKm, $profil)
+        : null;
+    $adaptiveRadiusM = $bestPrimary !== null
+        ? nr_rt_adaptive_radius_m($bestPrimary, $radiusM, $targetDistanceKm)
+        : null;
     if ($adaptiveRadiusM !== null) {
         $adaptiveRoutes = nr_rt_collect_variant_candidates(
             $ors,
@@ -305,7 +351,8 @@ function nr_rt_build_variant_route(
             $profil,
             $targetDistanceKm,
             $variantIndex,
-            $plan['primary_phase_offsets']
+            $plan['primary_phase_offsets'],
+            $avoidPolygons
         );
         $strictAdaptive = array_values(array_filter(
             $adaptiveRoutes,
@@ -331,7 +378,8 @@ function nr_rt_build_variant_route(
         $profil,
         $targetDistanceKm,
         $variantIndex,
-        $plan['secondary_phase_offsets']
+        $plan['secondary_phase_offsets'],
+        $avoidPolygons
     );
     $candidateRoutes = array_merge($candidateRoutes, $fallbackRoutes);
 
@@ -350,14 +398,63 @@ function nr_rt_build_variant_route(
     }
 
     if ($candidateRoutes !== []) {
-        return nr_rt_attach_quality_meta(
-            nr_rt_pick_best_candidate($candidateRoutes, $targetDistanceKm, $profil),
-            'scored',
-            $targetDistanceKm
-        );
+        $best = nr_rt_pick_best_candidate($candidateRoutes, $targetDistanceKm, $profil);
+        if (nr_rt_route_quality_ok($best, $targetDistanceKm, 'last_resort')) {
+            return nr_rt_attach_quality_meta($best, 'last_resort', $targetDistanceKm);
+        }
     }
 
-    throw new RuntimeException('Kein Rundkurs-Kandidat vorhanden.');
+    /*
+     * Notfall: avoid_polygons hat ORS so eingeengt, dass keine brauchbare Route durchkam,
+     * oder das Wegnetz erlaubt nur einen Kandidat mit deutlicher Doppelfahrt. Ein letzter
+     * Versuch komplett ohne avoid_polygons — die nachgelagerte Spike-Bereinigung im Client
+     * fängt verbleibende Sackgassen ab. Lieber eine ungesäuberte Schleife als gar keine Antwort.
+     */
+    if ($avoidPolygons !== null) {
+        $emergencyRoutes = nr_rt_collect_variant_candidates(
+            $ors,
+            $lat,
+            $lon,
+            $rotationDeg,
+            $radiusM,
+            $nLoop,
+            $profil,
+            $targetDistanceKm,
+            $variantIndex,
+            $plan['primary_phase_offsets'],
+            null
+        );
+        $candidateRoutes = array_merge($candidateRoutes, $emergencyRoutes);
+
+        foreach (['relaxed', 'fallback', 'last_resort'] as $level) {
+            $matching = array_values(array_filter(
+                $candidateRoutes,
+                static fn (array $route): bool => nr_rt_route_quality_ok($route, $targetDistanceKm, $level)
+            ));
+            if ($matching !== []) {
+                return nr_rt_attach_quality_meta(
+                    nr_rt_pick_best_candidate($matching, $targetDistanceKm, $profil),
+                    $level . '_no_avoid',
+                    $targetDistanceKm
+                );
+            }
+        }
+
+        if ($candidateRoutes !== []) {
+            // Allerletzter Notnagel: einfach den besten Kandidaten ausliefern, statt den User
+            // mit „Kein Rundkurs gefunden“ stehen zu lassen. Client-Bereinigung greift als
+            // zweite Verteidigungslinie.
+            return nr_rt_attach_quality_meta(
+                nr_rt_pick_best_candidate($candidateRoutes, $targetDistanceKm, $profil),
+                'emergency',
+                $targetDistanceKm
+            );
+        }
+    }
+
+    throw new RuntimeException(
+        'Kein Rundkurs konnte berechnet werden — bitte anderen Startpunkt, eine andere Distanz oder ein anderes Profil versuchen.'
+    );
 }
 
 /**
@@ -371,15 +468,6 @@ function nr_rt_build_variant_route(
 function nr_rt_profile_plan(string $profil): array
 {
     return match ($profil) {
-        'kurvig' => [
-            // Mehr Abzweige: kleiner chord_scale => mehr Hilfspunkte (nLoop steigt).
-            // Leicht kleiner Radius => weniger "glatte" Fernwege.
-            'radius_scale' => 0.94,
-            'chord_scale' => 0.62,
-            // Mehr Phasen-Offsets => mehr Kandidaten, meist mehr Kreuzungen/Turns.
-            'primary_phase_offsets' => [0.0, 9.0, -11.0, 18.0],
-            'secondary_phase_offsets' => [-22.0, 28.0, 36.0],
-        ],
         'radwege' => [
             'radius_scale' => 0.92,
             'chord_scale' => 1.18,
@@ -398,12 +486,6 @@ function nr_rt_profile_plan(string $profil): array
             'primary_phase_offsets' => [0.0, -10.0],
             'secondary_phase_offsets' => [12.0],
         ],
-        'abenteuer' => [
-            'radius_scale' => 1.16,
-            'chord_scale' => 0.8,
-            'primary_phase_offsets' => [0.0, 18.0],
-            'secondary_phase_offsets' => [-18.0, 32.0],
-        ],
         default => [
             'radius_scale' => 1.0,
             'chord_scale' => 1.0,
@@ -411,6 +493,31 @@ function nr_rt_profile_plan(string $profil): array
             'secondary_phase_offsets' => [12.0],
         ],
     };
+}
+
+/**
+ * @param array{
+ *   radius_scale: float,
+ *   chord_scale: float,
+ *   primary_phase_offsets: list<float>,
+ *   secondary_phase_offsets: list<float>
+ * } $plan
+ * @return array{
+ *   radius_scale: float,
+ *   chord_scale: float,
+ *   primary_phase_offsets: list<float>,
+ *   secondary_phase_offsets: list<float>
+ * }
+ */
+function nr_rt_fast_profile_plan(array $plan): array
+{
+    $primary = array_values(array_slice($plan['primary_phase_offsets'], 0, 1));
+    if ($primary === []) {
+        $primary = [0.0];
+    }
+    $plan['primary_phase_offsets'] = $primary;
+    $plan['secondary_phase_offsets'] = [];
+    return $plan;
 }
 
 function nr_rt_adaptive_radius_m(array $route, float $radiusM, float $targetDistanceKm): ?float
@@ -445,7 +552,8 @@ function nr_rt_collect_variant_candidates(
     string $profil,
     float $targetDistanceKm,
     int $variantIndex,
-    array $phaseOffsets
+    array $phaseOffsets,
+    ?array $avoidPolygons = null
 ): array {
     $candidateRoutes = [];
     foreach ($phaseOffsets as $phaseOffsetDeg) {
@@ -454,19 +562,33 @@ function nr_rt_collect_variant_candidates(
 
         foreach ([1, -1] as $direction) {
             $routePts = nr_rt_build_loop_points($center, $radiusM, $phaseRotationDeg, $nLoop, $direction);
-            $orsMeta = $ors->routeRoundtripLoopWithMeta($routePts, $profil);
+            try {
+                $orsMeta = $ors->routeRoundtripLoopWithMeta($routePts, $profil, $avoidPolygons);
+            } catch (Throwable $e) {
+                // Eine Phase darf scheitern (z. B. ORS findet wegen avoid_polygons keine Route durch
+                // einen engen Korridor). Andere Phasen/Richtungen liefern weiter Kandidaten.
+                if (nr_rt_is_ors_rate_limited($e)) {
+                    throw $e;
+                }
+                continue;
+            }
             $geojson = $orsMeta['geojson'];
             $detourCapped = (bool) ($orsMeta['detour_capped'] ?? false);
-            $candidateRoutes[] = nr_build_client_route_from_geojson($geojson, $profil, null, $detourCapped, [
-                'kind' => 'roundtrip',
-                'roundtrip_variant' => $variantIndex,
-                'roundtrip_mode' => 'circle_loop',
-                'roundtrip_spokes' => $nLoop,
-                'roundtrip_direction' => $direction > 0 ? 'clockwise' : 'counterclockwise',
-                'roundtrip_phase_offset_deg' => $phaseOffsetDeg,
-                'distance_km' => round($targetDistanceKm, 2),
-                'radius_km' => round($radiusM / 1000.0, 2),
-            ]);
+            try {
+                $candidateRoutes[] = nr_build_client_route_from_geojson($geojson, $profil, null, $detourCapped, [
+                    'kind' => 'roundtrip',
+                    'roundtrip_variant' => $variantIndex,
+                    'roundtrip_mode' => 'circle_loop',
+                    'roundtrip_spokes' => $nLoop,
+                    'roundtrip_direction' => $direction > 0 ? 'clockwise' : 'counterclockwise',
+                    'roundtrip_phase_offset_deg' => $phaseOffsetDeg,
+                    'distance_km' => round($targetDistanceKm, 2),
+                    'radius_km' => round($radiusM / 1000.0, 2),
+                ]);
+            } catch (Throwable $e) {
+                // GeoJSON ohne Geometrie / leeres Feature: Phase überspringen.
+                continue;
+            }
         }
     }
 
@@ -589,7 +711,6 @@ function nr_rt_profile_style_delta(array $route, string $profil): float
         'radwege' => abs($asphalt - 92.0) / 100.0,
         'ruhig' => abs($asphalt - 78.0) / 100.0,
         'gravel' => abs($nature - 58.0) / 100.0,
-        'abenteuer' => abs($nature - 84.0) / 100.0,
         default => abs($nature - 66.0) / 100.0,
     };
 }
@@ -891,18 +1012,30 @@ function nr_rt_route_quality_ok(array $route, float $targetDistanceKm, string $l
 {
     $score = nr_rt_candidate_score($route, $targetDistanceKm, (string) ($route['profil'] ?? 'natur'));
 
-    $maxSameStreetPenalty = $level === 'fallback' ? 1 : 0;
+    // last_resort und fallback dürfen Start/Ende auf gleicher Straße haben (z. B. lange Allee).
+    // strict/relaxed verlangen verschiedene Straßen — typisches Zeichen für „echten“ Rundkurs.
+    $maxSameStreetPenalty = ($level === 'fallback' || $level === 'last_resort') ? 1 : 0;
     if ($score['same_street_penalty'] > $maxSameStreetPenalty) {
         return false;
     }
-    if ($score['start_end_spike_penalty'] > 0) {
+    // Spike direkt am Start/Ende ist immer ein Ausschluss — Rundkurs darf nicht „aus der Sackgasse heraus“ starten.
+    if ($score['start_end_spike_penalty'] > 0 && $level !== 'last_resort') {
         return false;
+    }
+
+    // last_resort = breiter Floor: nur echte Schrottrouten ablehnen. Realistische ländliche
+    // Wegenetze haben oft 50–60 % Hin-/Rückweg-Identität, das ist noch ein gültiger Rundkurs.
+    if ($level === 'last_resort') {
+        return $score['dead_end_spike_ratio'] <= 0.07
+            && $score['self_overlap_ratio'] <= 0.32
+            && $score['overlap_ratio'] <= 0.78
+            && $score['distance_ratio_delta'] <= 1.20;
     }
 
     if ($level === 'fallback') {
         return $score['dead_end_spike_ratio'] <= 0.028
-            && $score['self_overlap_ratio'] <= 0.14
-            && $score['overlap_ratio'] <= 0.64
+            && $score['self_overlap_ratio'] <= 0.16
+            && $score['overlap_ratio'] <= 0.62
             && $score['distance_ratio_delta'] <= 0.85;
     }
 

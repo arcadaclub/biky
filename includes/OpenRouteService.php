@@ -32,7 +32,7 @@ final class OpenRouteService
      * @param list<array{0: float, 1: float}> $pointsWgs84 Lat, Lon
      * @return array{geojson: array<string, mixed>, detour_capped: bool}
      */
-    public function routeWithMeta(array $pointsWgs84, string $profil, ?float $maxDetourKm = null, bool $tightSnap = false): array
+    public function routeWithMeta(array $pointsWgs84, string $profil, ?float $maxDetourKm = null, bool $tightSnap = false, ?array $avoidPolygons = null): array
     {
         $this->assertReady();
         if (count($pointsWgs84) < 2) {
@@ -45,42 +45,25 @@ final class OpenRouteService
         $radiuses = self::waypointSnapRadiiList($n, $profil, $tightSnap);
 
         $body = self::buildRequestBody($profil, $coordinates, $radiuses);
+        if ($avoidPolygons !== null) {
+            self::applyAvoidPolygons($body, $avoidPolygons);
+        }
         $primary = $this->postGeoJson($slug, $body);
-
-        if ($maxDetourKm === null) {
-            return ['geojson' => $primary, 'detour_capped' => false];
-        }
-
-        $baselineBody = self::buildMinimalBodyWithPreference(
-            $coordinates,
-            self::waypointSnapRadiiList($n, 'gravel'),
-            'fastest'
-        );
-        $baseline = $this->postGeoJson('cycling-regular', $baselineBody);
-        $primaryDistance = self::routeDistanceM($primary);
-        $baselineDistance = self::routeDistanceM($baseline);
-
-        if ($primaryDistance <= 1.0 || $baselineDistance <= 1.0) {
-            return ['geojson' => $primary, 'detour_capped' => false];
-        }
-
-        $detourLimitM = max(0.0, min(150.0, $maxDetourKm)) * 1000.0;
-        if (($primaryDistance - $baselineDistance) <= $detourLimitM + 80.0) {
-            return ['geojson' => $primary, 'detour_capped' => false];
-        }
-
-        return ['geojson' => $baseline, 'detour_capped' => true];
+        // Das gewählte Profil ist bei jeder Routenberechnung verbindlich.
+        // Kein Fallback mehr auf eine schnelle Referenzstrecke mit anderem Profil.
+        return ['geojson' => $primary, 'detour_capped' => false];
     }
 
     /**
      * @param list<array{0: float, 1: float}> $pointsWgs84Closed Lat, Lon, letzter Punkt = erster
+     * @param array<string, mixed>|null $avoidPolygons GeoJSON Polygon/MultiPolygon — Bereiche, die ORS umfahren soll
      * @return array{geojson: array<string, mixed>, detour_capped: bool}
      */
-    public function routeRoundtripLoopWithMeta(array $pointsWgs84Closed, string $profil): array
+    public function routeRoundtripLoopWithMeta(array $pointsWgs84Closed, string $profil, ?array $avoidPolygons = null): array
     {
         $this->assertReady();
         if (count($pointsWgs84Closed) <= 50) {
-            return $this->routeRoundtripWithMeta($pointsWgs84Closed, $profil);
+            return $this->routeRoundtripWithMeta($pointsWgs84Closed, $profil, $avoidPolygons);
         }
 
         if (!function_exists('nr_merge_ors_roundtrip_geojsons')) {
@@ -90,7 +73,7 @@ final class OpenRouteService
         $chunks = self::splitClosedLoopWaypointsForOrs($pointsWgs84Closed, 50);
         $parts = [];
         foreach ($chunks as $chunk) {
-            $parts[] = $this->routeRoundtripWithMeta($chunk, $profil)['geojson'];
+            $parts[] = $this->routeRoundtripWithMeta($chunk, $profil, $avoidPolygons)['geojson'];
         }
 
         return [
@@ -108,7 +91,7 @@ final class OpenRouteService
      * @param list<array{0: float, 1: float}> $pointsWgs84Closed Lat, Lon (letzter Punkt = erster)
      * @return array{geojson: array<string, mixed>, detour_capped: bool}
      */
-    public function routeWaypointsLoopWithMeta(array $pointsWgs84Closed, string $profil): array
+    public function routeWaypointsLoopWithMeta(array $pointsWgs84Closed, string $profil, ?array $avoidPolygons = null): array
     {
         $this->assertReady();
         $pts = self::normalizeClosedLoopWaypoints($pointsWgs84Closed);
@@ -128,12 +111,58 @@ final class OpenRouteService
             if (abs($a[0] - $b[0]) < 1e-8 && abs($a[1] - $b[1]) < 1e-8) {
                 continue;
             }
-            $parts[] = $this->routeWithMeta([$a, $b], $profil, null, true)['geojson'];
+            $parts[] = $this->routeWithMeta([$a, $b], $profil, null, true, $avoidPolygons)['geojson'];
         }
 
         return [
             'geojson' => nr_merge_ors_roundtrip_geojsons($parts),
             'detour_capped' => false,
+        ];
+    }
+
+    /**
+     * Wegpunkte-Strecke: Start -> WP1 -> ... -> Ziel strikt segmentweise routen und zusammenführen.
+     * Dadurch werden Zwischenpunkte nicht nur als weiche Hint-Koordinaten an ORS übergeben,
+     * sondern als echte Teilziele erzwungen.
+     *
+     * @param list<array{0: float, 1: float}> $pointsWgs84 Lat, Lon
+     * @return array{geojson: array<string, mixed>, detour_capped: bool}
+     */
+    public function routeWaypointsPathWithMeta(
+        array $pointsWgs84,
+        string $profil,
+        ?float $maxDetourKm = null,
+        ?array $avoidPolygons = null
+    ): array {
+        $this->assertReady();
+        $pts = self::normalizePathWaypoints($pointsWgs84);
+        $n = count($pts);
+        if ($n < 2) {
+            throw new RuntimeException('Mindestens Start- und Zielpunkt erforderlich.');
+        }
+        if (!function_exists('nr_merge_ors_roundtrip_geojsons')) {
+            require_once __DIR__ . '/route_geojson.php';
+        }
+
+        $parts = [];
+        $detourCapped = false;
+        for ($i = 0; $i < $n - 1; $i++) {
+            $a = $pts[$i];
+            $b = $pts[$i + 1];
+            if (abs($a[0] - $b[0]) < 1e-8 && abs($a[1] - $b[1]) < 1e-8) {
+                continue;
+            }
+            $part = $this->routeWithMeta([$a, $b], $profil, $maxDetourKm, true, $avoidPolygons);
+            $parts[] = $part['geojson'];
+            $detourCapped = $detourCapped || (bool) ($part['detour_capped'] ?? false);
+        }
+        if ($parts === []) {
+            throw new RuntimeException('Keine gültigen Teilstrecken zwischen den Wegpunkten gefunden.');
+        }
+
+        return [
+            'geojson' => nr_merge_ors_roundtrip_geojsons($parts),
+            'detour_capped' => $detourCapped,
         ];
     }
 
@@ -171,10 +200,38 @@ final class OpenRouteService
     }
 
     /**
+     * @param list<array{0: float, 1: float}> $pointsWgs84
+     * @return list<array{0: float, 1: float}>
+     */
+    private static function normalizePathWaypoints(array $pointsWgs84): array
+    {
+        $out = [];
+        $eps = 1e-7;
+        foreach ($pointsWgs84 as $p) {
+            if (!is_array($p) || count($p) < 2) {
+                continue;
+            }
+            $lat = (float) $p[0];
+            $lon = (float) $p[1];
+            if (!is_finite($lat) || !is_finite($lon)) {
+                continue;
+            }
+            $prev = $out[count($out) - 1] ?? null;
+            if (is_array($prev) && abs($prev[0] - $lat) < $eps && abs($prev[1] - $lon) < $eps) {
+                continue;
+            }
+            $out[] = [$lat, $lon];
+        }
+
+        return $out;
+    }
+
+    /**
      * @param list<array{0: float, 1: float}> $pointsWgs84 Lat, Lon
+     * @param array<string, mixed>|null $avoidPolygons GeoJSON Polygon/MultiPolygon — Bereiche, die ORS umfahren soll
      * @return array{geojson: array<string, mixed>, detour_capped: bool}
      */
-    public function routeRoundtripWithMeta(array $pointsWgs84, string $profil): array
+    public function routeRoundtripWithMeta(array $pointsWgs84, string $profil, ?array $avoidPolygons = null): array
     {
         $this->assertReady();
         if (count($pointsWgs84) < 2) {
@@ -185,6 +242,9 @@ final class OpenRouteService
         $slug = self::engineProfileSlug($profil);
         $radiuses = self::waypointSnapRadiiList(count($coordinates), $profil);
         $body = self::buildRoundtripRequestBody($profil, $coordinates, $radiuses);
+        if ($avoidPolygons !== null) {
+            self::applyAvoidPolygons($body, $avoidPolygons);
+        }
 
         return [
             'geojson' => $this->postGeoJson($slug, $body),
@@ -221,7 +281,8 @@ final class OpenRouteService
         return match ($profil) {
             'ruhig', 'radwege' => 'cycling-road',
             'gravel' => 'cycling-regular',
-            'natur', 'abenteuer', 'offroad', 'kurvig' => 'cycling-mountain',
+            'natur', 'offroad' => 'cycling-mountain',
+            'kurvig' => 'cycling-regular',
             default => 'cycling-regular',
         };
     }
@@ -241,10 +302,7 @@ final class OpenRouteService
             'radwege' => $dense ? 205 : ($many ? 200 : 215),
             'ruhig' => $dense ? 240 : ($many ? 185 : 230),
             'gravel' => $dense ? 300 : ($many ? 235 : 310),
-            'abenteuer' => $dense ? 220 : ($many ? 190 : 235),
             'offroad' => $dense ? 320 : ($many ? 255 : 335),
-            // Kurvenreich: engeres Snapping, damit die Route häufiger auf kleine Wege/Abzweige "greift".
-            'kurvig' => $dense ? 230 : ($many ? 195 : 240),
             default => $dense ? 285 : ($many ? 220 : 295),
         };
 
@@ -281,7 +339,20 @@ final class OpenRouteService
     private static function buildRequestBody(string $profil, array $coordinates, array $radiuses): array
     {
         $body = self::buildMinimalBodyWithPreference($coordinates, $radiuses, 'recommended');
+        self::applyProfilePreferenceAndOptions($body, $profil);
 
+        return $body;
+    }
+
+    /**
+     * Profilspezifische Preference + Options. Wird sowohl vom Punkt-zu-Punkt-Routing
+     * (buildRequestBody) als auch vom Rundkurs-Routing (buildRoundtripRequestBody) genutzt,
+     * damit die Profil-Treue identisch ist.
+     *
+     * @param array<string, mixed> $body
+     */
+    private static function applyProfilePreferenceAndOptions(array &$body, string $profil): void
+    {
         if ($profil === 'ruhig') {
             $body['preference'] = 'recommended';
         } elseif ($profil === 'radwege') {
@@ -301,14 +372,9 @@ final class OpenRouteService
                     ],
                 ],
             ];
-        } elseif ($profil === 'kurvig') {
-            // Viele Abzweige: shortest + mountain-Profil erzeugt tendenziell kleinteiligere Wege.
-            $body['preference'] = 'shortest';
-        } elseif ($profil === 'abenteuer') {
-            $body['preference'] = 'shortest';
         }
-
-        return $body;
+        // kurvig: cycling-regular + recommended (Default-Body) — Tourenrad-Charakter,
+        // keine zusätzlichen Tweaks erforderlich.
     }
 
     /**
@@ -348,18 +414,58 @@ final class OpenRouteService
     }
 
     /**
+     * Avoid-Polygone in den ORS-Request schreiben (ergänzt vorhandene options-Konfiguration).
+     * `geometry` muss ein gültiges GeoJSON Polygon oder MultiPolygon sein. Leere Eingaben werden
+     * stillschweigend ignoriert, damit der Aufrufer nicht jedesmal selbst prüfen muss.
+     *
+     * @param array<string, mixed> $body
+     * @param array<string, mixed> $geometry
+     */
+    private static function applyAvoidPolygons(array &$body, array $geometry): void
+    {
+        $type = isset($geometry['type']) ? (string) $geometry['type'] : '';
+        $coords = $geometry['coordinates'] ?? null;
+        if (!in_array($type, ['Polygon', 'MultiPolygon'], true) || !is_array($coords) || $coords === []) {
+            return;
+        }
+        if (!isset($body['options']) || !is_array($body['options'])) {
+            $body['options'] = [];
+        }
+        $body['options']['avoid_polygons'] = [
+            'type' => $type,
+            'coordinates' => $coords,
+        ];
+    }
+
+    /**
      * @param list<array{0: float, 1: float}> $coordinates Lon, Lat
      * @param list<int> $radiuses
      * @return array<string, mixed>
      */
     private static function buildRoundtripRequestBody(string $profil, array $coordinates, array $radiuses): array
     {
+        // Rundkurs nutzt synthetische Kreis-Hilfspunkte. „shortest“ würde dort bei einigen
+        // Profilen quer über Forst-/Feldwege „abkürzen“ und nicht mehr nachvollziehbar entlang
+        // der erwarteten Wege führen. Daher hier konservativer als beim Punkt-zu-Punkt-Routing:
+        // nur Profile mit explizitem Distanz-Charakter bekommen „shortest“.
         $body = match ($profil) {
-            'gravel', 'offroad', 'abenteuer' => self::buildMinimalBodyWithPreference($coordinates, $radiuses, 'shortest'),
+            'gravel', 'offroad' => self::buildMinimalBodyWithPreference($coordinates, $radiuses, 'shortest'),
             default => self::buildMinimalBodyWithPreference($coordinates, $radiuses, 'recommended'),
         };
         if ($profil === 'radwege') {
             self::applyRoadCyclingOptions($body);
+        }
+        if ($profil === 'offroad') {
+            // Profil-Schärfung: passt zu „shortest“ und macht offroad besser unterscheidbar.
+            $body['options'] = [
+                'avoid_features' => ['ferries', 'fords', 'steps'],
+                'profile_params' => [
+                    'weightings' => [
+                        // 0–3, 2 = mittel — verhindert Routen über sehr steile Grate.
+                        'steepness_difficulty' => 2,
+                    ],
+                ],
+            ];
         }
 
         return $body;

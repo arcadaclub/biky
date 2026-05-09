@@ -31,7 +31,7 @@ if (!is_array($settings)) {
 $profileRaw = 'natur';
 if (isset($settings['lastProfile']) && is_string($settings['lastProfile'])) {
     $p = strtolower(trim($settings['lastProfile']));
-    if (in_array($p, ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'abenteuer', 'radwege'], true)) {
+    if (in_array($p, ['natur', 'gravel', 'offroad', 'kurvig', 'ruhig', 'radwege'], true)) {
         $profileRaw = $p;
     }
 }
@@ -138,14 +138,42 @@ if (is_file($appJsPath)) {
     <link rel="stylesheet" href="<?= htmlspecialchars($nrBasePath, ENT_QUOTES, 'UTF-8') ?>/assets/vendor/leaflet/leaflet.css">
     <link rel="stylesheet" href="<?= htmlspecialchars($appCssHref, ENT_QUOTES, 'UTF-8') ?>">
     <link rel="modulepreload" href="<?= htmlspecialchars($nrBasePath, ENT_QUOTES, 'UTF-8') ?>/assets/vendor/piper-tts-web/piper-tts-web.js">
+    <?php
+    // Piper-Vendor-Files möglichst früh verfügbar machen:
+    // `prefetch` statt `preload`, damit der Browser nur "idle" lädt und keine
+    // Warnungen ausgibt, wenn TTS in den ersten Sekunden nicht genutzt wird.
+    // Voice-Modell (60 MB) NICHT preloaden — wird lazy via OPFS-Cache geholt; preloaden würde
+    // mobile Bandbreite unnötig belasten, falls der User System-TTS wählt.
+    $piperPreloadAssets = [
+        'assets/vendor/onnxruntime-web/ort.min.js',
+        'assets/vendor/onnxruntime-web/ort-wasm-simd-threaded.wasm',
+        'assets/vendor/piper-wasm/piper_phonemize.wasm',
+        'assets/vendor/piper-wasm/piper_phonemize.data',
+    ];
+    foreach ($piperPreloadAssets as $relPath) {
+        $href = $nrBasePath . '/' . $relPath;
+        $as = str_ends_with($relPath, '.js') ? 'script' : (str_ends_with($relPath, '.wasm') ? 'fetch' : 'fetch');
+        $type = str_ends_with($relPath, '.js')
+            ? 'application/javascript'
+            : (str_ends_with($relPath, '.wasm') ? 'application/wasm' : 'application/octet-stream');
+        // `prefetch` unterstützt `as`/`type` (hilft beim richtigen Cache-Slot), ist aber weniger strikt als `preload`.
+        printf(
+            '    <link rel="prefetch" as="%s" type="%s" href="%s"%s>' . "\n",
+            $as,
+            $type,
+            htmlspecialchars($href, ENT_QUOTES, 'UTF-8'),
+            $as === 'fetch' ? ' crossorigin="anonymous"' : ''
+        );
+    }
+    ?>
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js" defer></script>
-    <title>Biky v2.5</title>
+    <title>Biky v2.7</title>
 </head>
 <body>
     <?php if (!$currentUser): ?>
     <div id="login-screen" class="login-screen" role="dialog" aria-modal="true" aria-labelledby="login-screen-title">
         <div class="login-screen-card">
-            <h1 class="login-screen-brand">Biky <span class="brand-version">v2.5</span></h1>
+            <h1 class="login-screen-brand">Biky <span class="brand-version">v2.7</span></h1>
             <h2 id="login-screen-title" class="login-screen-title">Anmelden</h2>
             <p class="login-screen-copy"><?= $nrWordPressAuth
                 ? 'Melden Sie sich mit Ihrem Club-Konto (WordPress) an.'
@@ -168,7 +196,7 @@ if (is_file($appJsPath)) {
                 <div class="top-bar-brand-slot">
                     <h1 class="brand">
                         <button type="button" id="btn-brand-reload" class="brand-reload" aria-label="Seite neu laden">
-                            Biky <span class="brand-version">v2.5</span>
+                            Biky <span class="brand-version">v2.7</span>
                         </button>
                     </h1>
                 </div>
@@ -270,6 +298,9 @@ if (is_file($appJsPath)) {
                                 <strong id="profile-current-value" class="profile-current-value">–</strong>
                             </div>
                         </button>
+                        <div class="btn-row">
+                            <button type="button" id="btn-route" class="btn btn-primary btn-route-calc" disabled>Route berechnen</button>
+                        </div>
                     </section>
                     <div id="profile-dialog" class="auth-dialog-overlay" hidden aria-hidden="true">
                         <div class="auth-dialog-card" role="dialog" aria-modal="true" aria-labelledby="profile-dialog-title" aria-describedby="profile-dialog-copy">
@@ -277,13 +308,30 @@ if (is_file($appJsPath)) {
                             <h2 id="profile-dialog-title" class="auth-dialog-title">Routingprofil wählen</h2>
                             <p id="profile-dialog-copy" class="auth-dialog-copy">Das Profil beeinflusst, welche Wege bevorzugt werden. Die Auswahl wird auf diesem Gerät gespeichert.</p>
                             <div class="profile-dialog-grid" role="list" aria-label="Routingprofile">
-                                <button type="button" class="btn profile-dialog-btn" data-profile="natur">Naturroute</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="gravel">Schotterroute</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="offroad">Feld-/Waldwege</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="kurvig">Kurvenreich</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="ruhig">Ruhige Route</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="radwege">Nur Radwege</button>
-                                <button type="button" class="btn profile-dialog-btn" data-profile="abenteuer">Abenteuerroute</button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="natur">
+                                    <span class="profile-dialog-btn-title">Naturroute</span>
+                                    <span class="profile-dialog-btn-desc">Mischung aus Asphalt und Naturwegen — auch über Wald- und Feldwege. Für Trekking- oder Mountainbike.</span>
+                                </button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="gravel">
+                                    <span class="profile-dialog-btn-title">Schotterroute</span>
+                                    <span class="profile-dialog-btn-desc">Bevorzugt Schotter und unbefestigte Wege auf der kürzesten Strecke. Passend für Gravel-Bikes.</span>
+                                </button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="offroad">
+                                    <span class="profile-dialog-btn-title">Feld-/Waldwege</span>
+                                    <span class="profile-dialog-btn-desc">Raue Pfade durch Wald und Feld, auch steile Anstiege möglich. Für Mountainbike oder robustes Trekkingrad.</span>
+                                </button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="kurvig">
+                                    <span class="profile-dialog-btn-title">Tourenrad</span>
+                                    <span class="profile-dialog-btn-desc">Klassische Tour auf Nebenstraßen und Radwegen. Das Standardprofil für ganz normale Fahrräder.</span>
+                                </button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="ruhig">
+                                    <span class="profile-dialog-btn-title">Ruhige Route</span>
+                                    <span class="profile-dialog-btn-desc">Bevorzugt verkehrsarme Asphaltstraßen — wenig Autos, angenehm zu fahren. Auch fürs Rennrad geeignet.</span>
+                                </button>
+                                <button type="button" class="btn profile-dialog-btn" data-profile="radwege">
+                                    <span class="profile-dialog-btn-title">Nur Radwege</span>
+                                    <span class="profile-dialog-btn-desc">Möglichst nur ausgewiesene Radwege und Asphalt. Meidet Schotter, Treppen und Furten — ideal fürs Rennrad.</span>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -326,9 +374,6 @@ if (is_file($appJsPath)) {
                                         <button type="button" id="btn-geocode-goal" class="btn btn-secondary geo-action-btn">Ziel suchen</button>
                                         <button type="button" id="btn-addressbook-goal" class="btn btn-secondary geo-action-btn" disabled>Aus Adressbuch</button>
                                         <button type="button" id="btn-addressbook-save-goal" class="btn btn-secondary geo-action-btn" disabled>Ins Adressbuch</button>
-                                    </div>
-                                    <div class="btn-row">
-                                        <button type="button" id="btn-route" class="btn btn-primary btn-route-calc" disabled>Route berechnen</button>
                                     </div>
                                     <ul id="goal-suggest" class="geo-suggest" role="listbox" aria-label="Vorschläge Ziel" hidden></ul>
                                 </fieldset>
@@ -465,6 +510,7 @@ if (is_file($appJsPath)) {
                     <div class="nav-stat-tiles" aria-label="Navigationsstatistik">
                         <span class="nav-stat-tile"><span class="nav-stat-label">Gefahren</span><strong id="nav-stat-distance">0,0 km</strong></span>
                         <span class="nav-stat-tile"><span class="nav-stat-label">Zeit</span><strong id="nav-stat-time">00:00</strong></span>
+                        <span class="nav-stat-tile" id="nav-stat-total-time-tile" hidden title="Geplante Gesamtdauer der Route (ORS-Schätzung, statisch)"><span class="nav-stat-label">Gesamtzeit</span><strong id="nav-stat-total">—</strong></span>
                         <span class="nav-stat-tile" title="Geschätzte Ankunft am Ziel"><span class="nav-stat-label">Ankunft</span><strong id="nav-stat-eta">—</strong></span>
                     </div>
                 </div>
@@ -747,6 +793,24 @@ if (is_file($appJsPath)) {
                 <h2 id="changelog-title" class="auth-dialog-title">Was ist neu?</h2>
                 <div id="changelog-body" class="changelog-body" role="region" aria-label="Letzte Aenderungen" tabindex="0">
                     <div class="changelog-day">
+                        <div class="changelog-day-date"><strong>9. Mai 2026</strong> · Version 2.7</div>
+                        <ul class="changelog-list">
+                            <li><strong>Profile aufgeräumt:</strong> „Abenteuerroute" entfernt (war zu ähnlich zu „Feld-/Waldwege"). „Kurvenreich" wurde zu <strong>„Tourenrad"</strong> — das neue Standardprofil für ganz normale Fahrräder.</li>
+                            <li><strong>Tourenrad bleibt auf echten Wegen:</strong> Vorher konnte die Route durch Singletrails oder Trampelpfade führen. Jetzt nur noch echte Rad- und Nebenstraßen.</li>
+                            <li><strong>Bessere Profil-Beschreibungen:</strong> Im Profil-Dialog steht unter jedem Profil eine kurze Erklärung — z. B. für welchen Fahrradtyp es passt.</li>
+                            <li><strong>„Neue Variante" beim Rundkurs ist deutlich schneller:</strong> Die Sackgassen-Bereinigung läuft mit weniger Anfragen ans Routing — die zweite Berechnung dauert nur noch einen Bruchteil.</li>
+                            <li><strong>Profil-Treue im Rundkurs verbessert:</strong> Das Profil „Feld-/Waldwege" nutzt jetzt zusätzliche Ausschlüsse (Fähren, Furten, Treppen) — die Routenwahl passt klarer zum gewählten Profil.</li>
+                        </ul>
+                    </div>
+                    <div class="changelog-day">
+                        <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.6</div>
+                        <ul class="changelog-list">
+                            <li><strong>Navigation: Gesamtzeit + Ankunft verbessert:</strong> Es gibt jetzt eine separate Kachel für die geplante <strong>Gesamtzeit</strong> (ORS-Schätzung) und eine <strong>Ankunft</strong>-Kachel, die als live Gesamtdauer (Start→Ziel) auf dein tatsächliches Tempo reagiert.</li>
+                            <li><strong>Bessere Anzeige am iPhone:</strong> Die Navigations-Kacheln sind auf kleinen Screens als 2×2 Grid angeordnet, damit nichts gequetscht wirkt.</li>
+                            <li><strong>Schnellerer Start (Piper):</strong> Wichtige Piper/ONNX Assets werden frühzeitig vorgeladen, damit Sprachausgabe und Navigation schneller bereit sind.</li>
+                        </ul>
+                    </div>
+                    <div class="changelog-day">
                         <div class="changelog-day-date"><strong>8. Mai 2026</strong> · Version 2.5</div>
                         <ul class="changelog-list">
                             <li><strong>Ankunftszeit im Navigationspanel:</strong> Eine neue Kachel zeigt die geschätzte Ankunftszeit als Uhrzeit an. Die Schätzung kombiniert die ursprüngliche Routen-Schätzung mit deinem tatsächlich gefahrenen Schnitt – Pausen und Tempowechsel werden berücksichtigt.</li>
@@ -858,6 +922,47 @@ if (is_file($appJsPath)) {
                             </div>
                         </div>
                     </div>
+                    <section id="konto-stats-panel" class="konto-stats-panel"<?= $currentUser ? '' : ' hidden' ?> aria-labelledby="konto-stats-title">
+                        <div class="konto-stats-head">
+                            <div>
+                                <span class="panel-user-kicker">Navigation</span>
+                                <h3 id="konto-stats-title" class="konto-stats-title">Gefahrene Kilometer</h3>
+                            </div>
+                        </div>
+                        <div class="konto-stats-totals" aria-label="Gesamtstatistik">
+                            <article class="konto-stat-card">
+                                <span class="konto-stat-card-label">Gesamt</span>
+                                <strong id="konto-total-kilometers" class="konto-stat-card-value"><?= $currentUser ? number_format((float) ($currentUser['total_kilometers'] ?? 0), 2, ',', '.') : '0,00' ?> km</strong>
+                            </article>
+                            <article class="konto-stat-card">
+                                <span class="konto-stat-card-label">Touren</span>
+                                <strong id="konto-total-routes" class="konto-stat-card-value"><?= $currentUser ? (int) ($currentUser['total_routes'] ?? 0) : 0 ?></strong>
+                            </article>
+                            <article class="konto-stat-card">
+                                <span class="konto-stat-card-label">Fahrzeit</span>
+                                <strong id="konto-total-nav-time" class="konto-stat-card-value"><?= $currentUser ? (int) ($currentUser['total_navigation_time'] ?? 0) : 0 ?> min</strong>
+                            </article>
+                        </div>
+                        <div class="konto-weekly-stats">
+                            <div class="konto-weekly-stats-head">
+                                <button type="button" id="konto-stats-prev-week" class="btn btn-secondary btn-mini" aria-label="Vorherige Woche anzeigen">←</button>
+                                <strong id="konto-stats-week-label" class="konto-stats-week-label">Wochenstatistik</strong>
+                                <button type="button" id="konto-stats-next-week" class="btn btn-secondary btn-mini" aria-label="Nächste Woche anzeigen">→</button>
+                            </div>
+                            <p id="konto-stats-week-subtitle" class="hint hint-small konto-stats-week-subtitle">Montag bis Sonntag</p>
+                            <div id="konto-stats-chart" class="konto-stats-chart" role="img" aria-label="Gefahrene Kilometer pro Wochentag">
+                                <?php foreach (['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'] as $weekdayLabel): ?>
+                                    <div class="konto-chart-col" data-weekday="<?= htmlspecialchars($weekdayLabel, ENT_QUOTES, 'UTF-8') ?>">
+                                        <span class="konto-chart-value">0,0 km</span>
+                                        <div class="konto-chart-bar-track">
+                                            <span class="konto-chart-bar" style="height: 4%"></span>
+                                        </div>
+                                        <span class="konto-chart-label"><?= htmlspecialchars($weekdayLabel, ENT_QUOTES, 'UTF-8') ?></span>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+                    </section>
                     <p id="auth-guest" class="hint"<?= $currentUser ? ' hidden' : '' ?>>Ohne Anmeldung ist die Karte sichtbar; Routing und Adresssuche sind nach dem Login freigeschaltet.</p>
                     <div id="auth-user" class="auth-user-box"<?= $currentUser ? '' : ' hidden' ?>>
                         <p id="auth-user-label" class="auth-user-label">
@@ -955,6 +1060,22 @@ if (is_file($appJsPath)) {
                     <button type="button" id="tts-engine-system" class="btn btn-secondary">System‑Stimme</button>
                 </div>
                 <p class="hint hint-small">Tipp: Piper benötigt beim ersten Laden etwas Zeit; danach ist es schnell.</p>
+            </div>
+        </div>
+        <div id="piper-prewarm-dialog" class="auth-dialog-overlay" hidden aria-hidden="true">
+            <div class="auth-dialog-card piper-prewarm-card" role="dialog" aria-modal="true" aria-labelledby="piper-prewarm-title" aria-describedby="piper-prewarm-copy">
+                <h2 id="piper-prewarm-title" class="auth-dialog-title">Piper wird vorbereitet…</h2>
+                <p id="piper-prewarm-copy" class="auth-dialog-copy">Hinweis: Beim ersten Starten muss das Sprachmodell für die Sprachausgabe geladen werden. Das kann je nach Gerät/Netz bis zu 5 Minuten dauern. Danach ist es meist deutlich schneller.</p>
+                <div class="piper-prewarm-progress" role="progressbar" aria-label="Piper Fortschritt" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="piper-prewarm-progress-track">
+                        <div id="piper-prewarm-progress-fill" class="piper-prewarm-progress-fill"></div>
+                    </div>
+                </div>
+                <p id="piper-prewarm-sub" class="hint hint-small" hidden></p>
+                <div class="btn-row">
+                    <button type="button" id="piper-prewarm-system" class="btn btn-secondary">System‑Stimme verwenden</button>
+                    <button type="button" id="piper-prewarm-hide" class="btn btn-ghost">Im Hintergrund laden</button>
+                </div>
             </div>
         </div>
     </div>

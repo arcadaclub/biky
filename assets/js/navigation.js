@@ -29,6 +29,8 @@
   const NAV_REROUTE_NEAR_END_M = 40;
   /** Zusätzlicher Zoom in „Karte Fahrtrichtung“ nach der Cover-Berechnung (Ränder, Kacheln, UI). */
   const NR_HEADING_OVERSCAN = 1.68;
+  /** Fahrtrichtungskarte insgesamt vier Leaflet-Zoomstufen weiter heraus darstellen. */
+  const NR_HEADING_LEAFLET_ZOOM_DELTA = -3.5;
 
   /**
    * OpenRouteService step.type (GeoJSON segments.steps), NICHT OSRM.
@@ -708,17 +710,31 @@
   }
 
   /**
-   * Geschätzte Ankunftszeit als HH:MM. Für Tagesübergänge (>12h Restzeit) wird "—" geliefert,
-   * weil ein konkreter Zeitpunkt dann kein nützliches Display ist (Pause/Rast/Tour-Ende).
+   * Gesamtdauer der Tour als kompakte Dauer (z.B. "1:23h" oder "45 min").
+   * Eingabe: Sekunden vom Start bis zum Endpunkt (also elapsed + remaining).
    */
-  function fmtEtaClock(remainingM, vEffMs) {
-    if (!Number.isFinite(remainingM) || remainingM <= 5) {
+  function fmtTotalDuration(totalSec) {
+    if (!Number.isFinite(totalSec) || totalSec < 0) {
       return '—';
     }
-    if (!Number.isFinite(vEffMs) || vEffMs < 0.4) {
+    if (totalSec > 12 * 3600) {
       return '—';
     }
-    const remainingSec = remainingM / vEffMs;
+    const sec = Math.max(0, Math.round(totalSec));
+    const h = Math.floor(sec / 3600);
+    const min = Math.round((sec - h * 3600) / 60);
+    if (h > 0) {
+      const m = min === 60 ? 0 : min;
+      const hh = min === 60 ? h + 1 : h;
+      return hh + ':' + String(m).padStart(2, '0') + 'h';
+    }
+    return min + ' min';
+  }
+
+  function fmtEtaClockFromRemainingSec(remainingSec) {
+    if (!Number.isFinite(remainingSec) || remainingSec <= 5) {
+      return '—';
+    }
     if (remainingSec > 12 * 3600) {
       return '—';
     }
@@ -1254,6 +1270,10 @@
     voiceEnabled: true,
     /** Separate Option: Fitness-Sterne/Bonuspunkte per Sprache ansagen */
     fitnessVoiceEnabled: true,
+    _currentSpeechToken: 0,
+    _currentSpeechKind: null,
+    _currentSpeechText: '',
+    _speechBusyUntilMs: 0,
     voiceVolume: 1,
     /** Nur wenn true: Navi darf sprechen (z.B. nach „Los geht’s“). */
     _speechArmed: true,
@@ -1324,6 +1344,18 @@
      * Reset nur bei `open()` (neue Tour), nicht bei `setRouteData()` (Routen-Austausch).
      */
     _distanceTraveledM: 0,
+    /** Timestamp des letzten Updates, das als Travel-Delta bewertet wurde (für Jump-/Jitter-Filter). */
+    _travelLastAtMs: null,
+    /**
+     * Geschwindigkeits-Samples für die ETA-Berechnung. Jedes Sample ist die
+     * Durchschnittsgeschwindigkeit zwischen zwei Kontrollpunkten (>= 5 s und >= 15 m
+     * Vorwärts-Bewegung auseinander). Limitiert auf die letzten 30 Werte.
+     */
+    _etaSpeedSamples: [],
+    _etaLastSampleAtMs: null,
+    _etaLastSampleTraveledM: null,
+    /** Geplante Routendauer in Sekunden aus dem Server-Payload (`duration` kommt in Minuten). */
+    _routePlannedDurationSec: null,
     /**
      * Wenn true, soll der nächste `open()`-Aufruf KEINE Tour-Counter zurücksetzen
      * (Strecke, Zeit, Fitnesspunkte, Welcome/Milestones). Wird beim „Zurück zum Start“
@@ -1350,6 +1382,22 @@
       this._rerouteInFlight = false;
       this._lastRerouteMs = Date.now();
       this._offRouteStreak = 0;
+    },
+
+    getCompletedNavigationStats: function () {
+      const endedAtMs = Date.now();
+      const startedAtMs =
+        this._navStartedAtMs != null && Number.isFinite(Number(this._navStartedAtMs)) ? Number(this._navStartedAtMs) : null;
+      const durationMinutes =
+        startedAtMs != null ? Math.max(1, Math.round((endedAtMs - startedAtMs) / 60000)) : null;
+      const distanceM = Number.isFinite(Number(this._distanceTraveledM)) ? Math.max(0, Number(this._distanceTraveledM)) : 0;
+      return {
+        started_at: startedAtMs != null ? new Date(startedAtMs).toISOString() : null,
+        ended_at: new Date(endedAtMs).toISOString(),
+        duration_minutes: durationMinutes,
+        distance_m: Math.round(distanceM),
+        distance_km: Math.round((distanceM / 1000) * 100) / 100,
+      };
     },
 
     acquireNavWakeLock: async function () {
@@ -2276,10 +2324,18 @@
         return false;
       }
       try {
+        const token = this._currentSpeechToken;
         const u = new SpeechSynthesisUtterance(String(text));
         u.lang = 'de-DE';
         u.volume = Math.max(0, Math.min(1, Number(this.voiceVolume) || 1));
         u.rate = 0.96;
+        const self = this;
+        u.onend = function () {
+          self._handleSpeechFinished(token, true);
+        };
+        u.onerror = function () {
+          self._handleSpeechFinished(token, false);
+        };
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(u);
         return true;
@@ -2355,10 +2411,17 @@
       if (!text || !this._speechArmed || !this.voiceEnabled || !this.isNavActive()) {
         return;
       }
+      text = String(text).trim();
+      if (!text) {
+        return;
+      }
       const engine = this._getTtsEngine();
       if (engine === 'system') {
+        const token = this._markSpeechStarted(kind, text);
         this.queueDebugLog('speech_engine_selected', { kind: kind, engine: 'system' }, false);
-        this._speakSystem(text);
+        if (!this._speakSystem(text)) {
+          this._handleSpeechFinished(token, false);
+        }
         return;
       }
       const piper = window.NRPiperTTS;
@@ -2381,7 +2444,9 @@
           true
         );
         // Fallback: wenn Piper (noch) nicht bereit ist, nicht stumm bleiben.
-        this._speakSystem(text);
+        if (!this._speakSystem(text)) {
+          this._handleSpeechFinished(token, false);
+        }
         return;
       }
 
@@ -2392,6 +2457,7 @@
         return;
       }
       this._lastSpeechAtMs = now;
+      const token = this._markSpeechStarted(kind, text);
 
       // iOS/Safari: autoplay / suspended context. Auch auf Desktop harmlos.
       this.primeNavAudioAndSpeech();
@@ -2425,6 +2491,7 @@
       self.queueDebugLog('speech_engine_selected', { kind: kind, engine: 'piper' }, false);
       speakPiperAttempt(1)
         .then(function (usedPiper) {
+          self._handleSpeechFinished(token, !!usedPiper);
           if (usedPiper || !self.isNavActive()) {
             return;
           }
@@ -2443,7 +2510,9 @@
                     { kind: kind, engine: 'system', reason: 'piper_returned_false_fallback' },
                     true
                   );
-                  self._speakSystem(text);
+                  if (!self._speakSystem(text)) {
+                    self._handleSpeechFinished(token, false);
+                  }
                 }
               })
               .catch(function (err2) {
@@ -2481,9 +2550,35 @@
               { kind: kind, engine: 'system', reason: 'piper_error_fallback' },
               true
             );
-            self._speakSystem(text);
+            if (!self._speakSystem(text)) {
+              self._handleSpeechFinished(token, false);
+            }
           }
         });
+    },
+
+    _estimateSpeechDurationMs: function (text, kind) {
+      void kind;
+      const chars = String(text || '').length;
+      return Math.max(900, Math.min(7000, chars * 52 + 900));
+    },
+
+    _markSpeechStarted: function (kind, text) {
+      const token = ++this._currentSpeechToken;
+      this._currentSpeechKind = kind;
+      this._currentSpeechText = String(text || '');
+      this._speechBusyUntilMs = Date.now() + this._estimateSpeechDurationMs(text, kind);
+      return token;
+    },
+
+    _handleSpeechFinished: function (token, ok) {
+      if (token !== this._currentSpeechToken) {
+        return;
+      }
+      this._currentSpeechKind = null;
+      this._currentSpeechText = '';
+      this._speechBusyUntilMs = 0;
+      void ok;
     },
 
     speakFitnessPoint: function (delta) {
@@ -2648,6 +2743,7 @@
         if (orsStepWarrantsSpeech(state.type) && state.distToManeuver <= windows.immediate) {
           const immediatePhrase = formatNavSpeechByStage(state, 'now');
           if (immediatePhrase) {
+            const d = Math.round(state.distToManeuver);
             this.queueDebugLog(
               'speech_trigger',
               {
@@ -3252,11 +3348,27 @@
         }
         mapHeadingBox.checked = !!self.mapHeadingUp;
         mapHeadingBox.addEventListener('change', function () {
-          self.mapHeadingUp = !!mapHeadingBox.checked;
+          const wasOn = !!self.mapHeadingUp;
+          const isOn = !!mapHeadingBox.checked;
+          self.mapHeadingUp = isOn;
           try {
             localStorage.setItem('nr_nav_map_heading', self.mapHeadingUp ? '1' : '0');
           } catch (errH) {
             /* Private Mode */
+          }
+          if (wasOn !== isOn && self.map && typeof self.map.getZoom === 'function' && typeof self.map.setZoom === 'function') {
+            try {
+              const cur = Number(self.map.getZoom());
+              if (Number.isFinite(cur)) {
+                const delta = isOn ? NR_HEADING_LEAFLET_ZOOM_DELTA : -NR_HEADING_LEAFLET_ZOOM_DELTA;
+                const next = cur + delta;
+                if (next > 0 && Math.abs(next - cur) >= 0.01) {
+                  self.map.setZoom(next, { animate: false });
+                }
+              }
+            } catch (eZoom) {
+              /* ignore */
+            }
           }
           self.refreshMapViewportForHeadingMode();
           if (self._lastLatLng && self.isNavActive()) {
@@ -3571,11 +3683,14 @@
     },
 
     setRouteData: function (data) {
+      const statTotal = document.getElementById('nav-stat-total');
+      const statTotalTile = document.getElementById('nav-stat-total-time-tile');
       if (!this.Lref || !data || !data.geometry || data.geometry.length < 2) {
         this.geometry = null;
         this.steps = [];
         this._lastLatLng = null;
         this._lastAlongMeters = null;
+        this._travelLastAtMs = null;
         this._maxAlongMeters = null;
         this._lastSnapSegIndex = null;
         this._temporaryRejoinMeta = null;
@@ -3592,19 +3707,29 @@
         this._fitnessAccumulatedM = 0;
         this._fitnessAwardedThisNav = 0;
         this._fitnessPrimed = false;
+        this._routePlannedDurationSec = null;
+        this._routeTotalDurationSec = null;
+        if (statTotal && statTotalTile) {
+          statTotalTile.hidden = true;
+          statTotal.textContent = '—';
+        }
         return;
       }
       this.geometry = data.geometry;
       this.cumDist = buildCumulativeDistances(data.geometry, this.Lref);
-      // ORS-Schätzung als ETA-Basis: distance ist in km, duration in Sekunden. Wenn vorhanden,
-      // ergibt sich daraus eine plausible Durchschnittsgeschwindigkeit (cycling-typisch
-      // 12-22 km/h) — dient als Fallback, wenn live noch keine Bewegung vorliegt.
+      // ORS-Schätzung als ETA-Basis: `distance` kommt in km, `duration` im Client-Payload
+      // in Minuten. Für die Geschwindigkeitsberechnung sauber in Sekunden umrechnen.
       const distanceKm = Number(data && data.distance);
-      const durationSec = Number(data && data.duration);
+      const durationMin = Number(data && data.duration);
+      const durationSec = durationMin * 60;
       if (Number.isFinite(distanceKm) && distanceKm > 0.05 && Number.isFinite(durationSec) && durationSec > 30) {
         this._routeAvgSpeedMs = (distanceKm * 1000) / durationSec;
+        this._routePlannedDurationSec = durationSec;
+        this._routeTotalDurationSec = durationSec;
       } else {
         this._routeAvgSpeedMs = null;
+        this._routePlannedDurationSec = null;
+        this._routeTotalDurationSec = null;
       }
       // Rundkurs erkennen — entweder über roundtrip_mode oder geometrische Nähe Start↔Ende.
       // Wichtig für die ETA: bei Rundkursen kann der initiale Snap fälschlich auf den
@@ -3641,6 +3766,14 @@
       this._lastSnapSegIndex = null;
       this._temporaryRejoinMeta = data._nrTemporaryRejoin || null;
       this._temporaryRejoinHandled = false;
+      if (statTotal && statTotalTile) {
+        const showTotalTime =
+          this._isRoundtripRoute &&
+          Number.isFinite(this._routePlannedDurationSec) &&
+          this._routePlannedDurationSec > 30;
+        statTotalTile.hidden = !showTotalTime;
+        statTotal.textContent = showTotalTime ? fmtTotalDuration(this._routePlannedDurationSec) : '—';
+      }
       // „Zurück zum Start“ ist eine Fortsetzung der laufenden Tour: der nachfolgende
       // `open()`-Aufruf darf weder Strecke, Zeit, Fitness noch Welcome/Milestones zurücksetzen.
       if (this.isNavActive() && data._nrReturnToStart === true) {
@@ -3664,9 +3797,39 @@
         }.bind(this)
       );
       this.legEnds = computeStepTriggerDistances(this.steps, this.cumDist);
+
+      // ETA-Ziel bei Rundkursen: letzter Navipunkt, der noch mindestens 500 m vor dem
+      // Startpunkt (= Ende der Rundkurs-Polyline) liegt.
+      this._etaTargetMRoundtrip = null;
+      if (this._isRoundtripRoute && this.steps.length >= 2 && this.cumDist.length >= 2) {
+        const totalM = Number(this.cumDist[this.cumDist.length - 1]) || 0;
+        const minDistanceFromEndM = 500;
+        for (let i = this.steps.length - 2; i >= 0; i--) {
+          const s = this.steps[i] || {};
+          const endIdx = Number(s.way_end_index);
+          const startIdx = Number(s.way_start_index);
+          let mPos = null;
+          if (Number.isFinite(endIdx) && this.cumDist[endIdx] != null) {
+            mPos = Number(this.cumDist[endIdx]);
+          } else if (Number.isFinite(startIdx) && this.cumDist[startIdx] != null) {
+            mPos = Number(this.cumDist[startIdx]);
+          }
+          if (Number.isFinite(mPos) && mPos > 0 && totalM - mPos >= minDistanceFromEndM) {
+            this._etaTargetMRoundtrip = mPos;
+            break;
+          }
+        }
+        if (this._etaTargetMRoundtrip == null) {
+          this._etaTargetMRoundtrip = totalM;
+        }
+      }
+
       this._navStepHysteresis.idx = null;
       this._lastSpeechStepKey = null;
       this._lastSpeechAtMs = 0;
+      this._currentSpeechKind = null;
+      this._currentSpeechText = '';
+      this._speechBusyUntilMs = 0;
       this._milestonesDone = {};
       this._lastDebugAtMs = 0;
       this._lastDebugStepKey = null;
@@ -3787,9 +3950,13 @@
         this._welcomeRetryCount = 0;
       }
       this._speechSuppressUntilMs = 0;
+      this._currentSpeechKind = null;
+      this._currentSpeechText = '';
+      this._speechBusyUntilMs = 0;
       this._navStepHysteresis.idx = null;
       this._filteredHeadingDeg = null;
       this._lastAlongMeters = null;
+      this._travelLastAtMs = null;
       this._maxAlongMeters = null;
       this._lastSnapSegIndex = null;
       this._lastDebugAtMs = 0;
@@ -3803,6 +3970,10 @@
         this._fitnessPrimed = false;
         // Tour-Zähler nur beim Tour-Start zurücksetzen — bei Reroute/Rückführung läuft er weiter.
         this._distanceTraveledM = 0;
+        this._travelLastAtMs = null;
+        this._etaSpeedSamples = [];
+        this._etaLastSampleAtMs = null;
+        this._etaLastSampleTraveledM = null;
       }
       this.queueDebugLog(
         'nav_open',
@@ -3869,6 +4040,7 @@
     },
 
     close: function () {
+      const completedStats = this.getCompletedNavigationStats();
       this.stopSimulation();
       this.stopGpsTracking();
       if (this._navFocusGuardIv != null) {
@@ -3904,9 +4076,18 @@
       this._lastPassedManeuverAlongM = 0;
       this._lastPassedManeuverIndex = -1;
       this._maxObservedNextIdx = -1;
+      const statTotal = document.getElementById('nav-stat-total');
+      const statTotalTile = document.getElementById('nav-stat-total-time-tile');
+      if (statTotal && statTotalTile) {
+        statTotalTile.hidden = true;
+        statTotal.textContent = '—';
+      }
       if (window.NRPiperTTS && typeof window.NRPiperTTS.cancel === 'function') {
         window.NRPiperTTS.cancel();
       }
+      this._currentSpeechKind = null;
+      this._currentSpeechText = '';
+      this._speechBusyUntilMs = 0;
       const sheet = document.getElementById('nav-sheet');
       if (sheet) {
         sheet.hidden = true;
@@ -3974,7 +4155,7 @@
       }
       if (this._feedbackAfterClose) {
         this._feedbackAfterClose = false;
-        document.dispatchEvent(new CustomEvent('nr-nav-ended'));
+        document.dispatchEvent(new CustomEvent('nr-nav-ended', { detail: completedStats }));
       }
     },
 
@@ -4182,6 +4363,56 @@
       }
     },
 
+    captureEtaSpeedSample: function () {
+      const ETA_SAMPLE_MIN_DT_MS = 5000;
+      const ETA_SAMPLE_MIN_DDIST_M = 15;
+      const ETA_SAMPLE_MAX = 30;
+      const nowMs = Date.now();
+      const traveledM = this._distanceTraveledM || 0;
+      if (this._etaLastSampleAtMs == null) {
+        this._etaLastSampleAtMs = nowMs;
+        this._etaLastSampleTraveledM = traveledM;
+        return;
+      }
+      const dt = nowMs - this._etaLastSampleAtMs;
+      const ddist = traveledM - (this._etaLastSampleTraveledM || 0);
+      if (dt < ETA_SAMPLE_MIN_DT_MS || ddist < ETA_SAMPLE_MIN_DDIST_M) {
+        return;
+      }
+      const vMs = ddist / (dt / 1000);
+      if (!Number.isFinite(vMs) || vMs <= 0) {
+        return;
+      }
+      if (!Array.isArray(this._etaSpeedSamples)) {
+        this._etaSpeedSamples = [];
+      }
+      this._etaSpeedSamples.push(vMs);
+      if (this._etaSpeedSamples.length > ETA_SAMPLE_MAX) {
+        this._etaSpeedSamples.shift();
+      }
+      this._etaLastSampleAtMs = nowMs;
+      this._etaLastSampleTraveledM = traveledM;
+    },
+
+    getTrimmedSpeedSampleMean: function () {
+      const samples = Array.isArray(this._etaSpeedSamples) ? this._etaSpeedSamples : [];
+      if (samples.length < 3) {
+        return null;
+      }
+      const sorted = samples.slice().sort(function (a, b) {
+        return a - b;
+      });
+      const trim = Math.floor(sorted.length * 0.2);
+      const trimmed = sorted.slice(trim, sorted.length - trim);
+      if (!trimmed.length) {
+        return null;
+      }
+      const sum = trimmed.reduce(function (a, b) {
+        return a + b;
+      }, 0);
+      return sum / trimmed.length;
+    },
+
     /**
      * @param {object} latlng Leaflet LatLng
      * @param {{ alongMeters?: number, headingDeg?: number|null, speedMs?: number }} [opts]
@@ -4194,6 +4425,7 @@
       }
 
       const totalRoute = this.cumDist[this.cumDist.length - 1] || 0;
+      const nowMs = Date.now();
       let along;
       const isSim =
         opts && typeof opts.alongMeters === 'number' && !Number.isNaN(opts.alongMeters);
@@ -4238,10 +4470,33 @@
       ) {
         const delta = along - this._lastAlongMeters;
         if (delta > 0) {
-          this._distanceTraveledM = (this._distanceTraveledM || 0) + delta;
+          let ok = true;
+          if (!isSim) {
+            // Nur "echte" Bewegung zählt: Stillstand + GPS-Jitter nicht als gefahrene Strecke werten.
+            const s = typeof speedMs === 'number' && Number.isFinite(speedMs) ? speedMs : 0;
+            if (s < 0.8) {
+              ok = false;
+            } else if (delta < 3) {
+              ok = false;
+            } else if (this._travelLastAtMs != null && Number.isFinite(Number(this._travelLastAtMs))) {
+              const dtMs = nowMs - Number(this._travelLastAtMs);
+              if (dtMs > 0) {
+                // Große Along-Sprünge (Snap/Reroute/GPS-Glitches) nicht als "gefahren" werten.
+                const maxPlausible = Math.max(20, s * (dtMs / 1000) * 1.9);
+                if (delta > maxPlausible) {
+                  ok = false;
+                }
+              }
+            }
+          }
+          if (ok) {
+            this._distanceTraveledM = (this._distanceTraveledM || 0) + delta;
+          }
         }
       }
+      this.captureEtaSpeedSample();
       this._lastAlongMeters = along;
+      this._travelLastAtMs = nowMs;
       this._maxAlongMeters = Math.max(this._maxAlongMeters || 0, along || 0);
       const state = resolveNavState(
         along,
@@ -4337,6 +4592,8 @@
 
       const statDistance = document.getElementById('nav-stat-distance');
       const statTime = document.getElementById('nav-stat-time');
+      const statTotal = document.getElementById('nav-stat-total');
+      const statTotalTile = document.getElementById('nav-stat-total-time-tile');
       const statEta = document.getElementById('nav-stat-eta');
       const nextDist = document.getElementById('nav-next-dist');
       const arrow = document.getElementById('nav-arrow');
@@ -4349,49 +4606,66 @@
       if (statTime) {
         statTime.textContent = fmtElapsedTime(Date.now() - (this._navStartedAtMs || Date.now()));
       }
+      if (statTotal && statTotalTile) {
+        const plannedDurationSec = Number(this._routePlannedDurationSec);
+        const showTotalTime = this._isRoundtripRoute && Number.isFinite(plannedDurationSec) && plannedDurationSec > 30;
+        statTotalTile.hidden = !showTotalTime;
+        statTotal.textContent = showTotalTime ? fmtTotalDuration(plannedDurationSec) : '—';
+      }
       if (statEta) {
+        const plannedDurationSec = Number(this._routePlannedDurationSec);
+        const elapsedSec = Math.max(0, (Date.now() - (this._navStartedAtMs || Date.now())) / 1000);
+        const hasPlannedRoundtripEta =
+          this._isRoundtripRoute && Number.isFinite(plannedDurationSec) && plannedDurationSec > 30;
+
         if (state.arrived) {
           statEta.textContent = '—';
+        } else if (hasPlannedRoundtripEta) {
+          statEta.textContent = fmtEtaClockFromRemainingSec(Math.max(0, plannedDurationSec - elapsedSec));
         } else {
+          const ETA_MIN_SAMPLES = 5;
+          const ETA_MIN_ELAPSED_MS = 60000;
+          const ETA_MIN_TRAVELED_M = 200;
+
           const totalRouteM = this.cumDist[this.cumDist.length - 1] || 0;
           const traveledM = this._distanceTraveledM || 0;
+          const elapsedMs = elapsedSec * 1000;
+          const samples = Array.isArray(this._etaSpeedSamples) ? this._etaSpeedSamples : [];
+          const sampleMean = this.getTrimmedSpeedSampleMean();
 
-          // Fortschritt für die ETA bestimmen. Bei Rundkursen ist Start ≈ Ende geometrisch
-          // identisch — der initiale (globale) Snap kann fälschlich auf den Endpunkt der
-          // Polyline landen. Erst wenn echte Bewegung vorliegt (>80 m gefahren), vertrauen
-          // wir dem Snap. Davor: kompletter Rundkurs steht noch bevor.
-          let progressM;
-          if (this._isRoundtripRoute && traveledM < 80) {
-            progressM = 0;
+          const enoughEtaData =
+            samples.length >= ETA_MIN_SAMPLES &&
+            elapsedMs >= ETA_MIN_ELAPSED_MS &&
+            traveledM >= ETA_MIN_TRAVELED_M &&
+            Number.isFinite(sampleMean) &&
+            sampleMean > 0.4;
+
+          if (!enoughEtaData) {
+            statEta.textContent = '—';
           } else {
-            // Monoton steigender Fortschritt: max(snap, höchster bisheriger, letzte Abbiegung)
-            // — verhindert ETA-Sprünge zurück bei kurzfristigem Snap-Wackeln.
-            progressM = Math.max(
-              along || 0,
-              this._maxAlongMeters || 0,
-              this._lastPassedManeuverAlongM || 0
-            );
-          }
-          const remainingM = Math.max(0, totalRouteM - progressM);
-
-          const elapsedMs = Date.now() - (this._navStartedAtMs || Date.now());
-          // Mischung aus ORS-Routenschnitt und live gefahrenem Schnitt:
-          //  - vor 30 s und unter 100 m: ORS-Schätzung (Live noch zu rauschig).
-          //  - danach: 60 % live + 40 % ORS, damit Unterschiede zur ORS-Schätzung
-          //    (Pause, Steigung, Gegenwind) realistisch ins ETA durchschlagen.
-          let vEff = this._routeAvgSpeedMs || null;
-          if (traveledM > 100 && elapsedMs > 30000) {
-            const vTraveled = traveledM / (elapsedMs / 1000);
-            if (vTraveled > 0.4) {
-              vEff = this._routeAvgSpeedMs ? 0.6 * vTraveled + 0.4 * this._routeAvgSpeedMs : vTraveled;
-            }
-          }
-          // Untergrenze 1,5 m/s (5,4 km/h, langsame Fahrradtour). Verhindert ETA = absurd weit
-          // in der Zukunft, wenn der User gerade Pause macht und vTraveled gegen 0 fällt.
-          if (Number.isFinite(vEff) && vEff > 0) {
+            let vEff = this._routeAvgSpeedMs
+              ? 0.6 * sampleMean + 0.4 * this._routeAvgSpeedMs
+              : sampleMean;
             vEff = Math.max(1.5, vEff);
+
+            let remainingM;
+            if (this._isRoundtripRoute) {
+              const targetM =
+                this._etaTargetMRoundtrip != null && Number.isFinite(this._etaTargetMRoundtrip)
+                  ? Number(this._etaTargetMRoundtrip)
+                  : totalRouteM;
+              remainingM = Math.max(0, targetM - elapsedSec * vEff);
+            } else {
+              const progressM = Math.max(
+                along || 0,
+                this._maxAlongMeters || 0,
+                this._lastPassedManeuverAlongM || 0
+              );
+              remainingM = Math.max(0, totalRouteM - progressM);
+            }
+
+            statEta.textContent = fmtEtaClock(remainingM, vEff);
           }
-          statEta.textContent = fmtEtaClock(remainingM, vEff);
         }
       }
       if (nextDist) {
@@ -4501,9 +4775,12 @@
       // Start-Zoom erst beim ersten echten Fix anwenden (nach Layout-Switch).
       if (!this._navStartZoomApplied && this.isNavActive() && this.map && typeof this.map.setZoom === 'function') {
         try {
-          const z0 = Number(this._navStartZoom);
-          if (Number.isFinite(z0) && z0 > 0) {
-            this.map.setZoom(z0, { animate: false });
+          const baseZoom = Number(this._navStartZoom);
+          if (Number.isFinite(baseZoom) && baseZoom > 0) {
+            const z0 = this.mapHeadingUp ? baseZoom + NR_HEADING_LEAFLET_ZOOM_DELTA : baseZoom;
+            if (z0 > 0) {
+              this.map.setZoom(z0, { animate: false });
+            }
           }
         } catch (e0) {
           /* ignore */

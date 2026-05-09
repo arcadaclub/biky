@@ -9,14 +9,9 @@ var __privateGet = (obj, member, getter) => (__accessCheck(obj, member, "read fr
 var __privateAdd = (obj, member, value) => member.has(obj) ? __typeError("Cannot add the same private member more than once") : member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
 var __privateSet = (obj, member, value, setter) => (__accessCheck(obj, member, "write to private field"), setter ? setter.call(obj, value) : member.set(obj, value), value);
 var _createPiperPhonemize, _modelConfig, _ort, _ortSession, _progressCallback, _wasmPaths, _logger;
-// Self-hosted voices (preferred). Place model files under assets/vendor/piper-voices/<PATH_MAP entry> (+.json).
-const HF_BASE_LOCAL = new URL("../piper-voices", import.meta.url).href.replace(/\/$/, "");
-// Remote fallback disabled (self-hosted only).
-const HF_BASE_REMOTE = HF_BASE_LOCAL;
-const HF_BASE = HF_BASE_LOCAL;
-// Not used when caller supplies wasmPaths (we do). Keep local to avoid accidental external fetch.
-const ONNX_BASE = new URL("../onnxruntime-web/", import.meta.url).href;
-const WASM_BASE = new URL("../piper-wasm/piper_phonemize", import.meta.url).href;
+const HF_BASE = "https://huggingface.co/diffusionstudio/piper-voices/resolve/main";
+const ONNX_BASE = "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/";
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize";
 const PATH_MAP = {
   "ar_JO-kareem-low": "ar/ar_JO/kareem/low/ar_JO-kareem-low.onnx",
   "ar_JO-kareem-medium": "ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx",
@@ -145,15 +140,7 @@ const PATH_MAP = {
   "it_IT-paola-medium": "it/it_IT/paola/medium/it_IT-paola-medium.onnx"
 };
 async function writeBlob(url, blob) {
-  // Cache sowohl Selfhost-Voices als auch HuggingFace-Voices im OPFS.
-  try {
-    const u = new URL(url, typeof window !== "undefined" ? window.location.href : void 0);
-    const isSelfHosted = u.pathname.includes("/assets/vendor/piper-voices/");
-    const isHf = u.hostname === "huggingface.co";
-    if (!isSelfHosted && !isHf) return;
-  } catch (e0) {
-    return;
-  }
+  if (!url.match("https://huggingface.co")) return;
   try {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle("piper", {
@@ -170,69 +157,17 @@ async function writeBlob(url, blob) {
 }
 async function removeBlob(url) {
   try {
-    try {
-      const u = new URL(url, typeof window !== "undefined" ? window.location.href : void 0);
-      const isSelfHosted = u.pathname.includes("/assets/vendor/piper-voices/");
-      const isHf = u.hostname === "huggingface.co";
-      if (!isSelfHosted && !isHf) return;
-    } catch (e0) {
-      return;
-    }
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle("piper");
     const path = url.split("/").at(-1);
-    // OPFS: FileSystemFileHandle hat i. d. R. kein .remove(); löschen läuft über removeEntry am DirectoryHandle.
-    try {
-      await dir.removeEntry(path);
-      return;
-    } catch (eRm) {
-      // Nicht schlimm: bei parallelen Retries kann der Entry schon weg sein.
-      try {
-        if (eRm && (eRm.name === "NotFoundError" || String(eRm.message || "").includes("Entry not found"))) {
-          return;
-        }
-      } catch (eMsg) {
-        /* ignore */
-      }
-      // Fallback: manche Implementierungen akzeptieren removeEntry nicht oder benötigen vorheriges Handle.
-      try {
-        const file = await dir.getFileHandle(path);
-        if (file && typeof file.remove === "function") {
-          await file.remove();
-          return;
-        }
-      } catch (eHandle) {
-        try {
-          if (eHandle && (eHandle.name === "NotFoundError" || String(eHandle.message || "").includes("Entry not found"))) {
-            return;
-          }
-        } catch (eMsg2) {
-          /* ignore */
-        }
-        /* ignore */
-      }
-      throw eRm;
-    }
+    const file = await dir.getFileHandle(path);
+    await file.remove();
   } catch (e) {
-    try {
-      if (e && (e.name === "NotFoundError" || String(e.message || "").includes("Entry not found"))) {
-        return;
-      }
-    } catch (eMsg3) {
-      /* ignore */
-    }
     console.error(e);
   }
 }
 async function readBlob(url) {
-  try {
-    const u = new URL(url, typeof window !== "undefined" ? window.location.href : void 0);
-    const isSelfHosted = u.pathname.includes("/assets/vendor/piper-voices/");
-    const isHf = u.hostname === "huggingface.co";
-    if (!isSelfHosted && !isHf) return;
-  } catch (e0) {
-    return;
-  }
+  if (!url.match("https://huggingface.co")) return;
   try {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle("piper", {
@@ -247,39 +182,25 @@ async function readBlob(url) {
 }
 async function fetchBlob(url, callback) {
   var _a;
-  const signal = typeof globalThis !== "undefined" ? globalThis.__nrPiperAbortSignal : void 0;
-  const res = await fetch(url, signal ? { signal } : void 0);
-  if (!res.ok) {
-    throw new Error(`Fetch failed (${res.status})`);
-  }
-  const clone = res.clone();
+  const res = await fetch(url);
   const reader = (_a = res.body) == null ? void 0 : _a.getReader();
-  if (!reader) {
-    return await clone.blob();
-  }
   const contentLength = +(res.headers.get("Content-Length") ?? 0);
   let receivedLength = 0;
   let chunks = [];
-  try {
-    while (reader) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      chunks.push(value);
-      receivedLength += value.length;
-      callback == null ? void 0 : callback({
-        url,
-        total: contentLength,
-        loaded: receivedLength
-      });
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
     }
-    return new Blob(chunks, { type: res.headers.get("Content-Type") ?? void 0 });
-  } catch (e) {
-    // Einige Browser werfen sporadisch "Error in input stream" beim Stream-Reader.
-    // Fallback auf blob() über den Response-Clone.
-    return await clone.blob();
+    chunks.push(value);
+    receivedLength += value.length;
+    callback == null ? void 0 : callback({
+      url,
+      total: contentLength,
+      loaded: receivedLength
+    });
   }
+  return new Blob(chunks, { type: res.headers.get("Content-Type") ?? void 0 });
 }
 function pcm2wav(buffer, numChannels, sampleRate) {
   const bufferLength = buffer.length;
@@ -455,22 +376,14 @@ async function getBlob(url, callback) {
 }
 async function download(voiceId, callback) {
   const path = PATH_MAP[voiceId];
-  const urlsLocal = [`${HF_BASE_LOCAL}/${path}`, `${HF_BASE_LOCAL}/${path}.json`];
-  const urlsRemote = [`${HF_BASE_REMOTE}/${path}`, `${HF_BASE_REMOTE}/${path}.json`];
-  await Promise.all(
-    urlsLocal.map(async (url, idx) => {
-      try {
-        writeBlob(url, await fetchBlob(url, url.endsWith(".onnx") ? callback : void 0));
-      } catch (e) {
-        const fb = urlsRemote[idx];
-        writeBlob(fb, await fetchBlob(fb, fb.endsWith(".onnx") ? callback : void 0));
-      }
-    })
-  );
+  const urls = [`${HF_BASE}/${path}`, `${HF_BASE}/${path}.json`];
+  await Promise.all(urls.map(async (url) => {
+    writeBlob(url, await fetchBlob(url, url.endsWith(".onnx") ? callback : void 0));
+  }));
 }
 async function remove(voiceId) {
   const path = PATH_MAP[voiceId];
-  const urls = [`${HF_BASE_LOCAL}/${path}`, `${HF_BASE_LOCAL}/${path}.json`, `${HF_BASE_REMOTE}/${path}`, `${HF_BASE_REMOTE}/${path}.json`];
+  const urls = [`${HF_BASE}/${path}`, `${HF_BASE}/${path}.json`];
   await Promise.all(urls.map((url) => removeBlob(url)));
 }
 async function stored() {
@@ -498,20 +411,12 @@ async function flush() {
 }
 async function voices() {
   try {
-    const res = await fetch(`${HF_BASE_LOCAL}/voices.json`);
+    const res = await fetch(`${HF_BASE}/voices.json`);
     if (!res.ok) throw new Error("Could not retrieve voices file from huggingface");
     return Object.values(await res.json());
   } catch {
-    try {
-      const res2 = await fetch(`${HF_BASE_REMOTE}/voices.json`);
-      if (res2.ok) {
-        return Object.values(await res2.json());
-      }
-    } catch {
-      /* ignore */
-    }
     const LOCAL_VOICES_JSON = await import("./voices_static-D_OtJDHM.js");
-    console.log(`Could not fetch voices.json. Fetching bundled static list`);
+    console.log(`Could not fetch voices.json remote ${HF_BASE}. Fetching local`);
     return Object.values(LOCAL_VOICES_JSON.default);
   }
 }
